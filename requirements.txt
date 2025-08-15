@@ -3,3 +3,4 @@ uvicorn
 twilio
 gunicorn
 python-multipart
+websockets
