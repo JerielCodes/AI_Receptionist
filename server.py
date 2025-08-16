@@ -44,26 +44,28 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist for {brand}. Represent the product, not a person. "
     f"The company is based in {loc}. "
-    "Default to ENGLISH; switch to SPANISH only if the caller clearly uses Spanish or asks. "
+    "DEFAULT LANGUAGE: ENGLISH. Only switch to SPANISH if the caller clearly speaks Spanish or asks. "
+    "Do NOT start in Spanish or any other language. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, offer to connect the caller. "
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request. "
-    "TOOLS (use them; don’t just talk about them):\n"
+    "TOOLS (you MUST actually use them when appropriate):\n"
     " - transfer_call(to?, reason?) → Bridge to a human (omit 'to' to use the default).\n"
     " - end_call(reason?) → Politely end the call.\n"
-    "CONFIRMATION THEN ACTION:\n"
-    " - If caller asks for a human in any way (connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), "
+    "ACTION RULES:\n"
+    " - If the caller asks for a human in any way (connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), "
     "   say a brief confirmation line, then call transfer_call and STOP speaking.\n"
-    " - If caller indicates they are done (that's all / bye / end the call / not interested), say a brief closing line, then call end_call.\n"
-    "SAFETY TOKENS (fallback): If you perform a transfer, include the text token <<TRANSFER>>; if you end the call, include <<HANGUP>>."
+    " - If the caller indicates they are done (that's all / bye / end the call / not interested), say a brief closing line, then call end_call.\n"
+    "SAFETY TOKENS (FALLBACK): Whenever you perform a transfer include the TEXT token <<TRANSFER>>; for hangup include <<HANGUP>>. "
+    "Never speak these tokens aloud; include them ONLY in the text channel."
 )
 
 def transfer_twiml(to_number: str, caller_id: str | None) -> str:
     vr = VoiceResponse()
     vr.say("Connecting you now.")
     d = Dial(answer_on_bridge=True)
-    d.number(to_number)  # caller_id defaults to Twilio number
+    d.number(to_number)  # caller_id defaults to the Twilio DID
     vr.append(d)
     return str(vr)
 
@@ -134,7 +136,7 @@ async def media(ws: WebSocket):
         with suppress(Exception): await session.close()
         with suppress(Exception): await ws.close()
 
-    # ---------- Realtime Session Setup (server VAD auto commits/replies) ----------
+    # ---------- Realtime Session Setup ----------
     tools = [
         {
             "type": "function",
@@ -168,7 +170,7 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 900,
-                    "create_response": True,        # let OpenAI handle commits & replies
+                    "create_response": True,      # let OpenAI handle commits & replies
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",  # Twilio Media Streams
@@ -201,7 +203,7 @@ async def media(ws: WebSocket):
 
     # ---------- State ----------
     tool_items: dict[str, dict] = {}
-    english_lock_turns = 2  # force EN for first two replies
+    # (We no longer send response.update, so no english_lock manipulation here.)
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
@@ -212,14 +214,12 @@ async def media(ws: WebSocket):
                 ev = data.get("event")
 
                 if ev == "media":
-                    # pass caller audio straight through
                     payload = (data.get("media", {}).get("payload") or "")
                     if payload:
                         await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
 
                 elif ev == "mark":
-                    # ignore our own heartbeat marks
-                    pass
+                    pass  # ignore our heartbeats
 
                 elif ev == "stop":
                     reason = (data.get("stop") or {}).get("reason")
@@ -231,7 +231,6 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal english_lock_turns
         try:
             while True:
                 msg = await oai.receive()
@@ -255,15 +254,7 @@ async def media(ws: WebSocket):
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # enforce EN for the first two replies
-                    elif t == "response.created" and english_lock_turns > 0:
-                        english_lock_turns -= 1
-                        await oai.send_json({
-                            "type": "response.update",
-                            "response": {"instructions": "Respond in ENGLISH."}
-                        })
-
-                    # ---------- TOOL CALLS ----------
+                    # ---------- TOOL CALLS (generic handlers) ----------
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") in ("tool_call", "function_call"):
@@ -311,12 +302,16 @@ async def media(ws: WebSocket):
                                     except Exception as e:
                                         log.exception(f"Hangup failed: {e}")
 
-                    # Fallback: text hints + safety tokens
+                    # ---------- FALLBACK TOKENS & TEXT HINTS ----------
                     elif t in ("response.output_text.delta", "response.output_text.done"):
-                        text_chunk = (evt.get("delta") or "") if t.endswith("delta") else " ".join(evt.get("output_text", []) or [])
+                        text_chunk = (evt.get("delta") or "") if t.endswith("delta") \
+                                     else " ".join(evt.get("output_text", []) or [])
                         low = (text_chunk or "").lower()
-                        if "<<transfer>>" in low or any(k in low for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now"]):
-                            if tw_client and call_sid:
+
+                        if "<<transfer>>" in low or any(k in low for k in [
+                            "connecting you", "let me connect", "i'll transfer you", "transfer you now"
+                        ]):
+                            if tw_client and call_sid and E164.match(TRANSFER_NUMBER):
                                 try:
                                     res = tw_client.calls(call_sid).update(
                                         twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
@@ -324,7 +319,10 @@ async def media(ws: WebSocket):
                                     log.info(f"Fallback transfer triggered (sid={res.sid}, status={res.status})")
                                 except Exception as e:
                                     log.exception(f"Fallback transfer failed: {e}")
-                        if "<<hangup>>" in low:
+
+                        if "<<hangup>>" in low or any(k in low for k in [
+                            "ending the call", "i'll end the call", "goodbye now"
+                        ]):
                             if tw_client and call_sid:
                                 try:
                                     res = tw_client.calls(call_sid).update(status="completed")
