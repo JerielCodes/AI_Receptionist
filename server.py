@@ -1,5 +1,6 @@
 # server.py
 import os, json, asyncio, logging, aiohttp
+from contextlib import suppress
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Dial
@@ -7,7 +8,6 @@ from twilio.rest import Client
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("elevara")
-
 app = FastAPI()
 
 # ---------- ENV ----------
@@ -43,20 +43,19 @@ INSTRUCTIONS = (
     " - transfer_call(to, reason?) → Bridge the caller to a human immediately.\n"
     " - end_call(reason?) → Politely end the call.\n"
     "INTENT (use the tools; don't just say you'll do it):\n"
-    " - If the caller indicates they want a human (e.g., connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), call transfer_call.\n"
-    " - If the caller indicates they are done (e.g., that's all / bye / end the call / not interested), call end_call.\n"
-    "CONFIRMATION RULES:\n"
-    " - For transfer: brief one-liner like “Absolutely—one moment while I connect you to the person in charge,” then call transfer_call and stop speaking.\n"
-    " - For end: brief closing like “Thanks for calling—ending the call now,” then call end_call and stop speaking.\n"
+    " - If the caller indicates they want a human (connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), call transfer_call.\n"
+    " - If the caller indicates they are done (that's all / bye / end the call / not interested), call end_call.\n"
+    "CONFIRMATION:\n"
+    " - For transfer: “Absolutely—one moment while I connect you to the person in charge,” then call transfer_call and stop speaking.\n"
+    " - For end: “Thanks for calling—ending the call now,” then call end_call and stop speaking.\n"
     "After calling a tool, do not continue speaking."
 )
 
 def transfer_twiml(to_number: str, caller_id: str | None) -> str:
-    """Create TwiML that bridges the current call to `to_number`."""
     vr = VoiceResponse()
     vr.say("Connecting you now.")
     d = Dial(answer_on_bridge=True)
-    d.number(to_number)  # use your Twilio number as caller ID by default
+    d.number(to_number)  # use Twilio number as caller ID by default
     vr.append(d)
     return str(vr)
 
@@ -112,19 +111,16 @@ async def media(ws: WebSocket):
         log.error(f"OpenAI connect failed: {e}")
         # fallback: if AI can't join, immediately transfer
         if tw_client and call_sid:
-            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
-            except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
+            with suppress(Exception):
+                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
         await ws.close(); return
 
     async def cleanup():
-        try: await oai.close()
-        except Exception: pass
-        try: await session.close()
-        except Exception: pass
-        try: await ws.close()
-        except Exception: pass
+        with suppress(Exception): await oai.close()
+        with suppress(Exception): await session.close()
+        with suppress(Exception): await ws.close()
 
-    # ---------- Realtime Session Setup (NO manual commits; let server VAD auto-reply) ----------
+    # ---------- Realtime Session Setup ----------
     tools = [
         {
             "type": "function",
@@ -159,7 +155,7 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 1000,
-                    "create_response": True,    # OpenAI will auto-start replies after user pauses
+                    "create_response": True,      # OpenAI auto-starts replies after user pauses
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
@@ -171,7 +167,7 @@ async def media(ws: WebSocket):
                 "tools": tools
             }
         })
-        # Initial greeting (tool_choice 'auto' enables tool use right away)
+        # Initial greeting; allow tools right away
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -183,12 +179,11 @@ async def media(ws: WebSocket):
     except Exception as e:
         log.error(f"OpenAI session.setup failed: {e}")
         if tw_client and call_sid:
-            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
-            except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
+            with suppress(Exception):
+                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
         await cleanup(); return
 
     # ---------- State ----------
-    # we don't manually trigger responses after each VAD commit (create_response=True already does it)
     tool_items: dict[str, dict] = {}  # accumulate tool args across deltas
 
     # ---------- Pumps ----------
@@ -214,19 +209,23 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
-                    # assistant audio -> Twilio
+                    # assistant audio -> Twilio (guard against closed ws)
                     if t == "response.audio.delta" and stream_sid:
-                        await ws.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": evt["delta"]}
-                        }))
+                        try:
+                            await ws.send_text(json.dumps({
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {"payload": evt["delta"]}
+                            }))
+                        except Exception:
+                            break  # Twilio socket likely closed
 
                     # barge-in: clear any queued TTS
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
-                        await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+                        with suppress(Exception):
+                            await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # -------- TOOL CALLS (current Realtime events) --------
+                    # ---------- TOOL CALLS (current Realtime events) ----------
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") in ("tool_call", "function_call"):
@@ -253,33 +252,27 @@ async def media(ws: WebSocket):
                                 target = args.get("to") or TRANSFER_NUMBER
                                 log.info(f"TOOL transfer_call -> {target}")
                                 if tw_client and call_sid:
-                                    try:
+                                    with suppress(Exception):
                                         tw_client.calls(call_sid).update(
                                             twiml=transfer_twiml(target, twilio_number)
                                         )
-                                    except Exception as e:
-                                        log.error(f"Live transfer failed (tool): {e}")
 
                             elif name == "end_call":
                                 log.info("TOOL end_call")
                                 if tw_client and call_sid:
-                                    try:
+                                    with suppress(Exception):
                                         tw_client.calls(call_sid).update(status="completed")
-                                    except Exception as e:
-                                        log.error(f"End call failed (tool): {e}")
 
-                    # -------- Optional: tiny text fallback if tool didn't fire --------
+                    # Optional: tiny text fallback if tool somehow didn't fire
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
-                        if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you"]):
+                        if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now"]):
                             log.info("Fallback transfer hint from text delta.")
                             if tw_client and call_sid:
-                                try:
+                                with suppress(Exception):
                                     tw_client.calls(call_sid).update(
                                         twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
                                     )
-                                except Exception as e:
-                                    log.error(f"Live transfer failed (fallback): {e}")
 
                     elif t == "error":
                         log.error(f"OpenAI error: {evt}")
@@ -289,5 +282,12 @@ async def media(ws: WebSocket):
         except Exception as e:
             log.info(f"openai_to_twilio ended: {e}")
 
-    await asyncio.gather(twilio_to_openai(), openai_to_twilio())
+    # Wait for whichever side finishes first, then cancel the other (prevents send-after-close)
+    t1 = asyncio.create_task(twilio_to_openai())
+    t2 = asyncio.create_task(openai_to_twilio())
+    done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()
+        with suppress(Exception):
+            await p
     await cleanup()
