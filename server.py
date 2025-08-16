@@ -40,10 +40,10 @@ INSTRUCTIONS = (
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request. "
     "TOOLS:\n"
-    " - transfer_call(to, reason?) → Bridge the caller to a human immediately.\n"
+    " - transfer_call(to?, reason?) → Bridge the caller to a human. If no 'to' is provided, use the default business line.\n"
     " - end_call(reason?) → Politely end the call.\n"
     "INTENT (use the tools; don't just say you'll do it):\n"
-    " - If the caller indicates they want a human (connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), call transfer_call.\n"
+    " - If the caller indicates they want a human (connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), call transfer_call (no args is fine).\n"
     " - If the caller indicates they are done (that's all / bye / end the call / not interested), call end_call.\n"
     "CONFIRMATION:\n"
     " - For transfer: “Absolutely—one moment while I connect you to the person in charge,” then call transfer_call and stop speaking.\n"
@@ -69,7 +69,6 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
-    # small TTS so Twilio hears immediate audio and keeps the stream open
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
@@ -109,7 +108,6 @@ async def media(ws: WebSocket):
         log.info("Connected to OpenAI Realtime")
     except Exception as e:
         log.error(f"OpenAI connect failed: {e}")
-        # fallback: if AI can't join, immediately transfer
         if tw_client and call_sid:
             with suppress(Exception):
                 tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
@@ -120,19 +118,18 @@ async def media(ws: WebSocket):
         with suppress(Exception): await session.close()
         with suppress(Exception): await ws.close()
 
-    # ---------- Realtime Session Setup ----------
+    # ---------- Realtime Session Setup (manual responses each turn) ----------
     tools = [
         {
             "type": "function",
             "name": "transfer_call",
-            "description": "Bridge the caller to a human immediately.",
+            "description": "Bridge the caller to a human immediately. If 'to' is omitted, use the default business line.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "to": {"type": "string", "description": "E.164 phone number to transfer to"},
-                    "reason": {"type": "string", "description": "Short reason for the transfer"}
-                },
-                "required": ["to"]
+                    "to": {"type": "string", "description": "E.164 number to transfer to (optional)"},
+                    "reason": {"type": "string", "description": "Short reason for the transfer (optional)"}
+                }
             }
         },
         {
@@ -154,8 +151,8 @@ async def media(ws: WebSocket):
             "session": {
                 "turn_detection": {
                     "type": "server_vad",
-                    "silence_duration_ms": 1000,
-                    "create_response": True,      # OpenAI auto-starts replies after user pauses
+                    "silence_duration_ms": 900,
+                    "create_response": False,       # we will create responses to ensure tool_choice='auto'
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
@@ -167,7 +164,7 @@ async def media(ws: WebSocket):
                 "tools": tools
             }
         })
-        # Initial greeting; allow tools right away
+        # Initial greeting with tools enabled
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -184,7 +181,8 @@ async def media(ws: WebSocket):
         await cleanup(); return
 
     # ---------- State ----------
-    tool_items: dict[str, dict] = {}  # accumulate tool args across deltas
+    tool_items: dict[str, dict] = {}
+    english_lock_turns = 2  # first two replies enforced EN
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
@@ -197,6 +195,8 @@ async def media(ws: WebSocket):
                     payload = (data.get("media", {}).get("payload") or "")
                     await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
                 elif ev == "stop":
+                    reason = (data.get("stop") or {}).get("reason")
+                    log.info(f"Twilio sent stop. reason={reason!r}")
                     break
         except Exception as e:
             log.info(f"twilio_to_openai ended: {e}")
@@ -209,7 +209,7 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
-                    # assistant audio -> Twilio (guard against closed ws)
+                    # assistant audio -> Twilio
                     if t == "response.audio.delta" and stream_sid:
                         try:
                             await ws.send_text(json.dumps({
@@ -225,7 +225,18 @@ async def media(ws: WebSocket):
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # ---------- TOOL CALLS (current Realtime events) ----------
+                    # A user turn ended -> we create a reply with tools enabled
+                    elif t == "input_audio_buffer.committed":
+                        req = {
+                            "type": "response.create",
+                            "response": {"modalities": ["audio", "text"], "tool_choice": "auto"}
+                        }
+                        if english_lock_turns > 0:
+                            english_lock_turns -= 1
+                            req["response"]["instructions"] = "Respond in ENGLISH."
+                        await oai.send_json(req)
+
+                    # ---------- TOOL CALLS ----------
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") in ("tool_call", "function_call"):
@@ -282,10 +293,26 @@ async def media(ws: WebSocket):
         except Exception as e:
             log.info(f"openai_to_twilio ended: {e}")
 
-    # Wait for whichever side finishes first, then cancel the other (prevents send-after-close)
+    async def twilio_heartbeat():
+        # keep the media socket warm (avoid idle/proxy drops)
+        try:
+            while True:
+                await asyncio.sleep(15)
+                if stream_sid:
+                    with suppress(Exception):
+                        await ws.send_text(json.dumps({
+                            "event": "mark",
+                            "streamSid": stream_sid,
+                            "mark": {"name": "hb"}
+                        }))
+        except Exception:
+            pass
+
+    # Race the three tasks; cancel the others when one ends
     t1 = asyncio.create_task(twilio_to_openai())
     t2 = asyncio.create_task(openai_to_twilio())
-    done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+    t3 = asyncio.create_task(twilio_heartbeat())
+    done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
     for p in pending:
         p.cancel()
         with suppress(Exception):
