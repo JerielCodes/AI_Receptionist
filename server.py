@@ -63,10 +63,9 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
-    # Tiny spoken line so caller hears something instantly
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
-    log.info(f"Returning TwiML with stream URL: wss://{host}/media}")
+    log.info(f"Returning TwiML with stream URL: wss://{host}/media")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
 # ---------- MEDIA STREAM (OpenAI Realtime) ----------
