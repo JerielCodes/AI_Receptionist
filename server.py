@@ -116,7 +116,7 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # Configure session + greet
+    # Configure session + greet (server VAD handles commits)
     try:
         await oai.send_json({
             "type": "session.update",
@@ -143,41 +143,11 @@ async def media(ws: WebSocket):
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # ---------- Turn-taking state ----------
-    base64_bytes_since_last_commit = 0
-    BASE64_THRESHOLD = 1000    # ~5 x 20ms frames of μ-law 8k when base64 encoded
-    response_active = True     # greeting in progress
-    pending_commit_task: asyncio.Task | None = None
-
-    async def schedule_commit_after_delay():
-        """Debounce commit by ~150ms to let late audio frames arrive."""
-        nonlocal base64_bytes_since_last_commit, response_active, pending_commit_task
-        try:
-            await asyncio.sleep(0.15)
-            if base64_bytes_since_last_commit >= BASE64_THRESHOLD:
-                log.info(f"COMMIT {base64_bytes_since_last_commit}b")
-                await oai.send_json({"type": "input_audio_buffer.commit"})
-                base64_bytes_since_last_commit = 0
-                if not response_active:
-                    response_active = True
-                    await oai.send_json({
-                        "type": "response.create",
-                        "response": {"modalities": ["audio", "text"]}
-                    })
-            else:
-                # Not enough audio; skip
-                log.info(f"SKIP COMMIT (only {base64_bytes_since_last_commit}b)")
-                base64_bytes_since_last_commit = 0
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            log.error(f"commit task error: {e}")
-        finally:
-            pending_commit_task = None
+    # ---------- State ----------
+    response_active = True  # greeting in progress
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
-        nonlocal base64_bytes_since_last_commit, pending_commit_task
         try:
             while True:
                 msg = await ws.receive_text()
@@ -186,7 +156,7 @@ async def media(ws: WebSocket):
 
                 if ev == "media":
                     payload = (data.get("media", {}).get("payload") or "")
-                    base64_bytes_since_last_commit += len(payload)
+                    # just append; no manual commit in server_vad mode
                     await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
 
                 elif ev == "stop":
@@ -195,7 +165,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, base64_bytes_since_last_commit, pending_commit_task
+        nonlocal response_active
         try:
             while True:
                 msg = await oai.receive()
@@ -227,15 +197,17 @@ async def media(ws: WebSocket):
                         }))
 
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
-                        # Cancel any pending commit; caller resumed talking
-                        if pending_commit_task and not pending_commit_task.done():
-                            pending_commit_task.cancel()
+                        # cancel audio playback for barge-in
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    elif t == "input_audio_buffer.speech_stopped":
-                        # Schedule a debounced commit; don't do it immediately
-                        if pending_commit_task is None:
-                            pending_commit_task = asyncio.create_task(schedule_commit_after_delay())
+                    elif t == "input_audio_buffer.committed":
+                        # server VAD has committed the user turn; request a response if idle
+                        if not response_active:
+                            response_active = True
+                            await oai.send_json({
+                                "type": "response.create",
+                                "response": {"modalities": ["audio", "text"]}
+                            })
 
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
