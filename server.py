@@ -51,7 +51,6 @@ INSTRUCTIONS = (
 )
 
 def transfer_twiml(to_number: str) -> str:
-    """Build TwiML to bridge the caller to a human."""
     vr = VoiceResponse()
     vr.say("Connecting you now.")
     d = Dial(answer_on_bridge=True)
@@ -75,7 +74,6 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
-    # Small prompt so Twilio hears audio immediately and keeps the stream alive
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
@@ -111,9 +109,7 @@ async def media(ws: WebSocket):
         session = aiohttp.ClientSession()
         oai = await session.ws_connect(
             "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-            headers=headers,
-            heartbeat=20,
-            max_msg_size=2**23,
+            headers=headers, heartbeat=20, max_msg_size=2**23
         )
         log.info("Connected to OpenAI Realtime")
     except Exception as e:
@@ -162,8 +158,8 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 900,
-                    "create_response": True,     # let OpenAI create responses after each user pause
-                    "interrupt_response": True,
+                    "create_response": True,
+                    "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
@@ -171,10 +167,10 @@ async def media(ws: WebSocket):
                 "modalities": ["audio", "text"],
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
                 "instructions": INSTRUCTIONS,
-                "tools": tools,
+                "tools": tools
             }
         })
-        # Initial greeting (tools allowed from the first turn)
+        # Initial greeting
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -190,10 +186,11 @@ async def media(ws: WebSocket):
                 tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER))
         await cleanup(); return
 
-    # ---------- State ----------
-    tool_items: dict[str, dict] = {}
+    # ---------- State (for both event shapes) ----------
+    output_items: dict[str, dict] = {}   # id -> {"name": str, "args": str}
+    fn_calls: dict[str, dict] = {}       # call_id/id -> {"name": str, "args": str}
 
-    # ---------- Helpers ----------
+    # ---------- Actions ----------
     def do_transfer(reason: str | None = None, to: str | None = None):
         target = to or TRANSFER_NUMBER
         if not (tw_client and call_sid and valid_e164(target)):
@@ -211,7 +208,6 @@ async def media(ws: WebSocket):
         with suppress(Exception):
             tw_client.calls(call_sid).update(status="completed")
 
-    # Conservative, generic fallback intent detector (assistant text)
     TRANSFER_HINTS = [
         "connecting you", "let me connect", "i'll transfer you", "transfer you now",
         "connect you now", "patch you through", "transfer now"
@@ -227,7 +223,6 @@ async def media(ws: WebSocket):
                 ev = data.get("event")
                 if ev == "media":
                     payload = (data.get("media", {}).get("payload") or "")
-                    # forward audio to OpenAI
                     await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
                 elif ev == "mark":
                     pass
@@ -249,6 +244,12 @@ async def media(ws: WebSocket):
                     t = evt.get("type")
                     log.info(f"OAI EVT: {t}")
 
+                    # --- Show transcripts (debug) ---
+                    if t == "conversation.item.input_audio_transcription.delta":
+                        log.info(f"USER>> {evt.get('delta')}")
+                    if t == "response.audio_transcript.delta":
+                        log.info(f"ASSISTANT>> {evt.get('delta')}")
+
                     # assistant audio -> Twilio
                     if t == "response.audio.delta" and stream_sid:
                         try:
@@ -258,51 +259,74 @@ async def media(ws: WebSocket):
                                 "media": {"payload": evt["delta"]}
                             }))
                         except Exception:
-                            break  # Twilio socket closed
+                            break
 
-                    # barge-in: clear any queued TTS
+                    # barge-in
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # --------- TOOL CALLS (handle all current shapes) ----------
+                    # --------- PATH A: output_item.* tool events ----------
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") in ("tool_call", "function_call"):
-                            tool_items[item["id"]] = {"name": item.get("name"), "args": ""}
+                            output_items[item["id"]] = {"name": item.get("name"), "args": ""}
 
                     elif t == "response.output_item.delta":
                         item = evt.get("item", {})
                         iid = item.get("id")
-                        if iid in tool_items and "arguments" in item:
-                            tool_items[iid]["args"] += item["arguments"]
+                        if iid in output_items and "arguments" in item:
+                            output_items[iid]["args"] += item["arguments"]
 
                     elif t == "response.output_item.completed":
                         item = evt.get("item", {})
-                        iid = item.get("id")
-                        info = tool_items.pop(iid, None)
+                        iid  = item.get("id")
+                        info = output_items.pop(iid, None)
                         if info:
                             name = info.get("name")
                             try:
                                 args = json.loads(item.get("arguments") or info.get("args") or "{}")
                             except Exception:
                                 args = {}
-                            log.info(f"TOOL COMPLETE: {name} args={args}")
-
+                            log.info(f"TOOL (output_item) COMPLETE: {name} args={args}")
                             if name == "transfer_call":
                                 do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
-
                             elif name == "end_call":
                                 do_hangup(reason=args.get("reason"))
+
+                    # --------- PATH B: function_call_arguments.* events ----------
+                    elif t == "response.function_call_arguments.delta":
+                        cid   = evt.get("call_id") or evt.get("id") or "unknown"
+                        name  = evt.get("name")
+                        delta = evt.get("arguments", "")
+                        fc = fn_calls.setdefault(cid, {"name": name, "args": ""})
+                        if name: fc["name"] = name
+                        fc["args"] += delta
+
+                    elif t == "response.function_call_arguments.done":
+                        cid  = evt.get("call_id") or evt.get("id") or "unknown"
+                        info = fn_calls.pop(cid, {"name": evt.get("name"), "args": evt.get("arguments", "")})
+                        name = info.get("name")
+                        raw  = info.get("args", "") or ""
+                        try:
+                            args = json.loads(raw or "{}")
+                        except Exception:
+                            log.error(f"Bad JSON for function args: {raw!r}")
+                            args = {}
+                        log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
+                        if name == "transfer_call":
+                            do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
+                        elif name == "end_call":
+                            do_hangup(reason=args.get("reason"))
 
                     # --------- TEXT FALLBACKS ----------
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
                         if any(k in txt for k in TRANSFER_HINTS):
-                            log.info("Text fallback: transfer hint detected in delta.")
+                            log.info("Text fallback: transfer hint in delta.")
                             do_transfer()
                         elif any(k in txt for k in HANGUP_HINTS):
-                            log.info("Text fallback: hangup hint detected in delta.")
+                            log.info("Text fallback: hangup hint in delta.")
                             do_hangup()
 
                     elif t == "error":
@@ -316,7 +340,6 @@ async def media(ws: WebSocket):
             log.info(f"openai_to_twilio ended: {e}")
 
     async def twilio_heartbeat():
-        # keep the media socket warm (avoid idle/proxy drops)
         try:
             while True:
                 await asyncio.sleep(15)
