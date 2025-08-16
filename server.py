@@ -35,8 +35,8 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist for {owner} in {loc}. "
     "Default to ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
-    "Tone: warm, professional, friendly, emotion-aware. 1–2 concise sentences unless asked. "
-    f"Value props: {vals}. Offer the trial if interest is shown: {trial}. "
+    "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
+    f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller.\n"
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request.\n"
     "TRANSFER PROTOCOL: If the caller clearly asks to speak to a person/the person in charge/Jeriel, "
@@ -75,7 +75,7 @@ async def media(ws: WebSocket):
         await ws.close(); return
     await ws.accept()
 
-    # Wait for Twilio 'start' (get callSid & our Twilio number)
+    # Wait for Twilio 'start'
     stream_sid = call_sid = twilio_number = None
     try:
         while True:
@@ -91,7 +91,7 @@ async def media(ws: WebSocket):
         log.error(f"Twilio start wait failed: {e}")
         await ws.close(); return
 
-    # Connect to OpenAI Realtime (audio <-> audio+text)
+    # OpenAI Realtime WS
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
     try:
         session = aiohttp.ClientSession()
@@ -115,7 +115,7 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # Configure session + immediate greeting (keeps Twilio alive)
+    # Configure session + immediate English greeting
     try:
         await oai.send_json({
             "type": "session.update",
@@ -132,7 +132,7 @@ async def media(ws: WebSocket):
             "type": "response.create",
             "response": {
                 "modalities": ["audio", "text"],
-                "instructions": "Start in English. Greet briefly and ask how you can help."
+                "instructions": "Start in ENGLISH. Greet briefly and ask how you can help."
             }
         })
     except Exception as e:
@@ -142,31 +142,30 @@ async def media(ws: WebSocket):
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # ---- State: reply/commit control ----
-    appended_since_last_commit = False  # True only if we've appended real caller audio
-    response_active = True              # greeting is in progress
+    # ---- State: safe commit + response gating ----
+    base64_bytes_since_last_commit = 0  # count base64 chars appended (proxy for audio duration)
+    BASE64_THRESHOLD = 1000            # ~100ms of μ-law 8k once base64-encoded
+    response_active = True             # greeting is in progress
 
     # ---- Pumps ----
     async def twilio_to_openai():
-        nonlocal appended_since_last_commit
+        nonlocal base64_bytes_since_last_commit
         try:
             while True:
                 msg = await ws.receive_text()
                 data = json.loads(msg)
                 ev = data.get("event")
                 if ev == "media":
-                    appended_since_last_commit = True
-                    await oai.send_json({
-                        "type": "input_audio_buffer.append",
-                        "audio": data["media"]["payload"]  # base64 μ-law 8k
-                    })
+                    payload = data["media"]["payload"] or ""
+                    base64_bytes_since_last_commit += len(payload)
+                    await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
                 elif ev == "stop":
                     break
         except Exception as e:
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, appended_since_last_commit
+        nonlocal response_active, base64_bytes_since_last_commit
         try:
             while True:
                 msg = await oai.receive()
@@ -202,20 +201,22 @@ async def media(ws: WebSocket):
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # Only commit if we actually appended caller audio
+                    # On speech stop: only COMMIT if we buffered >= ~100ms since last commit
                     elif t == "input_audio_buffer.speech_stopped":
-                        if appended_since_last_commit:
+                        if base64_bytes_since_last_commit >= BASE64_THRESHOLD:
                             await oai.send_json({"type": "input_audio_buffer.commit"})
-                            appended_since_last_commit = False
-                            # Ask for a reply only if none is active
+                            base64_bytes_since_last_commit = 0
                             if not response_active:
                                 response_active = True
                                 await oai.send_json({
                                     "type": "response.create",
                                     "response": {"modalities": ["audio", "text"]}
                                 })
+                        else:
+                            # Not enough audio—skip commit to avoid commit_empty
+                            base64_bytes_since_last_commit = 0
 
-                    # Mid-stream transfer if the token appears in the text delta
+                    # Mid-stream transfer trigger (delta text)
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
                             try:
