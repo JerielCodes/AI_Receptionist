@@ -1,39 +1,33 @@
 # server.py
-import os, re, json, asyncio, logging, aiohttp
+import os, json, asyncio, logging, aiohttp, re
 from contextlib import suppress
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from twilio.rest import Client
 
-# ---------- Logging ----------
+# ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("elevara")
+
 app = FastAPI()
 
 # ---------- ENV ----------
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "+1YOURCELLPHONE")   # E.164 like +1267...
+TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "")
 TW_SID          = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN        = os.getenv("TWILIO_AUTH_TOKEN", "")
 tw_client = Client(TW_SID, TW_TOKEN) if (TW_SID and TW_TOKEN) else None
 
-E164 = re.compile(r"^\+[1-9]\d{7,14}$")
+def valid_e164(n: str | None) -> bool:
+    return bool(n and re.fullmatch(r"\+\d{7,15}", n))
 
-if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY missing -> AI disabled.")
-if not tw_client:
-    log.warning("Twilio creds missing -> transfer/hangup disabled (tw_client=None).")
-if "YOURCELLPHONE" in TRANSFER_NUMBER or not E164.match(TRANSFER_NUMBER):
-    log.warning("TRANSFER_NUMBER invalid or placeholder; set E.164 like +1267...")
-
-# ---------- Business Prompt ----------
+# ---------- BUSINESS PROMPT ----------
 def load_kb():
     try:
         with open("business.json", "r") as f:
             return json.load(f)
-    except Exception as e:
-        log.warning(f"business.json not loaded (defaults): {e}")
+    except Exception:
         return {}
 
 KB    = load_kb()
@@ -43,62 +37,59 @@ vals  = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • ins
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
-    f"You are the {brand} AI receptionist for {brand}. Represent the product, not a person. "
-    f"The company is based in {loc}. "
-    "DEFAULT LANGUAGE: ENGLISH. Only switch to SPANISH if the caller clearly speaks Spanish or asks. "
-    "Do NOT start in Spanish or any other language. "
+    f"You are the {brand} AI receptionist. You represent the product {brand} (based in {loc}). "
+    "Default to ENGLISH; switch to SPANISH only if the caller clearly speaks Spanish or asks. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
-    "Never invent business facts; if unsure, offer to connect the caller. "
+    "Never invent business facts; if unsure, say so and offer to connect the caller. "
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request. "
-    "TOOLS (actually use them when appropriate):\n"
-    " - transfer_call(to?, reason?) → Bridge to a human (omit 'to' to use the default).\n"
+    "TOOLS:\n"
+    " - transfer_call(to?, reason?) → Bridge to a human now (omit 'to' to use the default).\n"
     " - end_call(reason?) → Politely end the call.\n"
-    "ACTION RULES:\n"
-    " - If the caller asks for a human in any way (connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), "
-    "   say a brief confirmation line, then call transfer_call and STOP speaking.\n"
-    " - If the caller indicates they are done (that's all / bye / end the call / not interested), say a brief closing line, then call end_call.\n"
-    "SAFETY TOKENS (FALLBACK): When you perform a transfer include the TEXT token <<TRANSFER>>; for hangup include <<HANGUP>>. "
-    "Never speak these tokens aloud; include them ONLY in the text channel."
+    "IMPORTANT: Actually CALL tools; don’t merely mention them. After calling a tool, stop speaking.\n"
+    "TRANSFER INTENT examples: connect me, human, person, agent, manager, person in charge, owner, Jeriel, live agent."
 )
 
-# ---------- Helpers ----------
 def transfer_twiml(to_number: str) -> str:
+    """Build TwiML to bridge the caller to a human."""
     vr = VoiceResponse()
     vr.say("Connecting you now.")
     d = Dial(answer_on_bridge=True)
-    d.number(to_number)  # caller_id defaults to the Twilio DID
+    d.number(to_number)
     vr.append(d)
     return str(vr)
 
-# ---------- Health ----------
+# ---------- HEALTH ----------
 @app.get("/")
 def health():
     return {
-        "ok": bool(OPENAI_API_KEY),
+        "ok": True,
+        "ai_enabled": bool(OPENAI_API_KEY),
         "twilio_ready": bool(tw_client),
-        "transfer_ready": E164.match(TRANSFER_NUMBER) is not None,
-        "transfer_number": TRANSFER_NUMBER,
+        "transfer_ready": valid_e164(TRANSFER_NUMBER),
+        "transfer_number": TRANSFER_NUMBER if valid_e164(TRANSFER_NUMBER) else None,
     }
 
-# ---------- Twilio webhook ----------
+# ---------- TWILIO VOICE WEBHOOK ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
+    # Small prompt so Twilio hears audio immediately and keeps the stream alive
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
-# ---------- Media stream ----------
+# ---------- MEDIA STREAM ----------
 @app.websocket("/media")
 async def media(ws: WebSocket):
     if not OPENAI_API_KEY:
+        log.error("No OPENAI_API_KEY; closing media socket.")
         await ws.close(); return
     await ws.accept()
 
-    # Twilio START
+    # Wait for Twilio 'start'
     stream_sid = call_sid = twilio_number = None
     try:
         while True:
@@ -114,21 +105,23 @@ async def media(ws: WebSocket):
         log.error(f"Twilio start wait failed: {e}")
         await ws.close(); return
 
-    # OpenAI Realtime
+    # OpenAI Realtime WS
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
     try:
         session = aiohttp.ClientSession()
         oai = await session.ws_connect(
             "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-            headers=headers, heartbeat=20, max_msg_size=2**23
+            headers=headers,
+            heartbeat=20,
+            max_msg_size=2**23,
         )
         log.info("Connected to OpenAI Realtime")
     except Exception as e:
         log.error(f"OpenAI connect failed: {e}")
-        if tw_client and call_sid and E164.match(TRANSFER_NUMBER):
+        if tw_client and call_sid and valid_e164(TRANSFER_NUMBER):
             with suppress(Exception):
-                res = tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER))
-                log.info(f"Fallback transfer issued. sid={res.sid} status={res.status}")
+                log.info("AI failed; falling back to immediate transfer.")
+                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER))
         await ws.close(); return
 
     async def cleanup():
@@ -136,7 +129,7 @@ async def media(ws: WebSocket):
         with suppress(Exception): await session.close()
         with suppress(Exception): await ws.close()
 
-    # Realtime session config
+    # ---------- Tools ----------
     tools = [
         {
             "type": "function",
@@ -146,9 +139,9 @@ async def media(ws: WebSocket):
                 "type": "object",
                 "properties": {
                     "to": {"type": "string", "description": "E.164 number to transfer to (optional)"},
-                    "reason": {"type": "string", "description": "Short reason (optional)"}
-                }
-            }
+                    "reason": {"type": "string", "description": "Short reason (optional)"},
+                },
+            },
         },
         {
             "type": "function",
@@ -156,13 +149,12 @@ async def media(ws: WebSocket):
             "description": "Politely end the call.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "reason": {"type": "string", "description": "Optional closing reason"}
-                }
-            }
-        }
+                "properties": {"reason": {"type": "string", "description": "Optional closing reason"}},
+            },
+        },
     ]
 
+    # ---------- Session setup ----------
     try:
         await oai.send_json({
             "type": "session.update",
@@ -170,8 +162,8 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 900,
-                    "create_response": True,     # let OpenAI manage commits & replying
-                    "interrupt_response": True
+                    "create_response": True,     # let OpenAI create responses after each user pause
+                    "interrupt_response": True,
                 },
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
@@ -179,9 +171,10 @@ async def media(ws: WebSocket):
                 "modalities": ["audio", "text"],
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
                 "instructions": INSTRUCTIONS,
-                "tools": tools
+                "tools": tools,
             }
         })
+        # Initial greeting (tools allowed from the first turn)
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -192,69 +185,40 @@ async def media(ws: WebSocket):
         })
     except Exception as e:
         log.error(f"OpenAI session.setup failed: {e}")
-        if tw_client and call_sid and E164.match(TRANSFER_NUMBER):
+        if tw_client and call_sid and valid_e164(TRANSFER_NUMBER):
             with suppress(Exception):
-                res = tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER))
-                log.info(f"Fallback transfer issued. sid={res.sid} status={res.status}")
+                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER))
         await cleanup(); return
 
-    # ---- State / helpers ----
-    tool_parts: dict[str, dict] = {}
-    action_done = False  # guard: transfer/hangup only once
+    # ---------- State ----------
+    tool_items: dict[str, dict] = {}
 
-    async def do_transfer(target: str | None, source: str):
-        nonlocal action_done
-        if action_done: 
+    # ---------- Helpers ----------
+    def do_transfer(reason: str | None = None, to: str | None = None):
+        target = to or TRANSFER_NUMBER
+        if not (tw_client and call_sid and valid_e164(target)):
+            log.error(f"TRANSFER blocked (client? {bool(tw_client)} call? {bool(call_sid)} target_valid? {valid_e164(target)})")
             return
-        action_done = True
-        target = target or TRANSFER_NUMBER
-        if not E164.match(target):
-            log.error(f"[{source}] Transfer aborted: invalid target {target!r}")
-            await cleanup(); return
-        if not (tw_client and call_sid):
-            log.error(f"[{source}] Transfer aborted: Twilio client/callSid not ready.")
-            await cleanup(); return
-        try:
-            res = tw_client.calls(call_sid).update(twiml=transfer_twiml(target))
-            log.info(f"[{source}] TRANSFER -> {target} (sid={res.sid}, status={res.status})")
-        except Exception as e:
-            log.exception(f"[{source}] Transfer failed: {e}")
-        finally:
-            await cleanup()
+        log.info(f"TRANSFERRING via Twilio REST -> {target} reason={reason!r}")
+        with suppress(Exception):
+            tw_client.calls(call_sid).update(twiml=transfer_twiml(target))
 
-    async def do_hangup(source: str):
-        nonlocal action_done
-        if action_done:
+    def do_hangup(reason: str | None = None):
+        if not (tw_client and call_sid):
+            log.error("HANGUP blocked (missing Twilio client or call_sid)")
             return
-        action_done = True
-        if not (tw_client and call_sid):
-            log.error(f"[{source}] Hangup aborted: Twilio client/callSid not ready.")
-            await cleanup(); return
-        try:
-            res = tw_client.calls(call_sid).update(status="completed")
-            log.info(f"[{source}] HANGUP -> completed (sid={res.sid}, status={res.status})")
-        except Exception as e:
-            log.exception(f"[{source}] Hangup failed: {e}")
-        finally:
-            await cleanup()
+        log.info(f"HANGUP via Twilio REST. reason={reason!r}")
+        with suppress(Exception):
+            tw_client.calls(call_sid).update(status="completed")
 
-    # Phrase lists (fallback if tools not used)
+    # Conservative, generic fallback intent detector (assistant text)
     TRANSFER_HINTS = [
         "connecting you", "let me connect", "i'll transfer you", "transfer you now",
-        "connecting now", "putting you through", "patch you through"
+        "connect you now", "patch you through", "transfer now"
     ]
-    HANGUP_HINTS = [
-        "ending the call", "i'll end the call", "goodbye now", "ending now"
-    ]
-    # Spanish fallbacks
-    TRANSFER_HINTS_ES = [
-        "conectarte ahora", "te transfiero", "transferirte", "pasarte con", "comunicarte con"
-    ]
-    HANGUP_HINTS_ES = [
-        "terminando la llamada", "colgar ahora", "finalizar la llamada"
-    ]
+    HANGUP_HINTS = ["ending the call", "goodbye", "bye for now"]
 
-    # ---- Pumps ----
+    # ---------- Pumps ----------
     async def twilio_to_openai():
         try:
             while True:
@@ -263,10 +227,13 @@ async def media(ws: WebSocket):
                 ev = data.get("event")
                 if ev == "media":
                     payload = (data.get("media", {}).get("payload") or "")
-                    if payload:
-                        await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
+                    # forward audio to OpenAI
+                    await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
+                elif ev == "mark":
+                    pass
                 elif ev == "stop":
-                    log.info("Twilio sent stop.")
+                    reason = (data.get("stop") or {}).get("reason")
+                    log.info(f"Twilio sent stop. reason={reason!r}")
                     break
         except asyncio.CancelledError:
             pass
@@ -279,14 +246,11 @@ async def media(ws: WebSocket):
                 msg = await oai.receive()
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     evt = json.loads(msg.data)
-                    et = evt.get("type")
+                    t = evt.get("type")
+                    log.info(f"OAI EVT: {t}")
 
-                    # Log key events for visibility
-                    if et in ("response.created", "response.completed", "response.failed"):
-                        log.info(f"OAI: {et}")
-
-                    # Assistant audio back to Twilio
-                    if et == "response.audio.delta" and stream_sid:
+                    # assistant audio -> Twilio
+                    if t == "response.audio.delta" and stream_sid:
                         try:
                             await ws.send_text(json.dumps({
                                 "event": "media",
@@ -294,66 +258,55 @@ async def media(ws: WebSocket):
                                 "media": {"payload": evt["delta"]}
                             }))
                         except Exception:
-                            break
+                            break  # Twilio socket closed
 
-                    # Barge-in
-                    elif et == "input_audio_buffer.speech_started" and stream_sid:
+                    # barge-in: clear any queued TTS
+                    elif t == "input_audio_buffer.speech_started" and stream_sid:
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # Tool calls (generic)
-                    elif et == "response.output_item.added":
+                    # --------- TOOL CALLS (handle all current shapes) ----------
+                    elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") in ("tool_call", "function_call"):
-                            tool_parts[item["id"]] = {"name": item.get("name"), "args": ""}
+                            tool_items[item["id"]] = {"name": item.get("name"), "args": ""}
 
-                    elif et == "response.output_item.delta":
+                    elif t == "response.output_item.delta":
                         item = evt.get("item", {})
                         iid = item.get("id")
-                        if iid in tool_parts and "arguments" in item:
-                            tool_parts[iid]["args"] += item["arguments"]
+                        if iid in tool_items and "arguments" in item:
+                            tool_items[iid]["args"] += item["arguments"]
 
-                    elif et == "response.output_item.completed":
+                    elif t == "response.output_item.completed":
                         item = evt.get("item", {})
-                        iid  = item.get("id")
-                        info = tool_parts.pop(iid, None)
+                        iid = item.get("id")
+                        info = tool_items.pop(iid, None)
                         if info:
                             name = info.get("name")
                             try:
                                 args = json.loads(item.get("arguments") or info.get("args") or "{}")
                             except Exception:
                                 args = {}
-                            log.info(f"OAI tool completed: {name} args={args}")
+                            log.info(f"TOOL COMPLETE: {name} args={args}")
 
                             if name == "transfer_call":
-                                await do_transfer(args.get("to"), "tool")
-                                return
-                            if name == "end_call":
-                                await do_hangup("tool")
-                                return
+                                do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
 
-                    # Text output (fallback triggers + full visibility)
-                    elif et in ("response.output_text.delta", "response.output_text.done"):
-                        if et.endswith("delta"):
-                            text = (evt.get("delta") or "")
-                            log.info(f"AI says (delta): {text!r}")
-                            low = text.lower()
-                        else:
-                            chunks = evt.get("output_text", []) or []
-                            text = " ".join(chunks)
-                            log.info(f"AI says (done): {text!r}")
-                            low = text.lower()
+                            elif name == "end_call":
+                                do_hangup(reason=args.get("reason"))
 
-                        if ("<<transfer>>" in low) or any(h in low for h in TRANSFER_HINTS + TRANSFER_HINTS_ES):
-                            await do_transfer(None, "text-fallback")
-                            return
+                    # --------- TEXT FALLBACKS ----------
+                    elif t == "response.output_text.delta":
+                        txt = (evt.get("delta") or "").lower()
+                        if any(k in txt for k in TRANSFER_HINTS):
+                            log.info("Text fallback: transfer hint detected in delta.")
+                            do_transfer()
+                        elif any(k in txt for k in HANGUP_HINTS):
+                            log.info("Text fallback: hangup hint detected in delta.")
+                            do_hangup()
 
-                        if ("<<hangup>>" in low) or any(h in low for h in HANGUP_HINTS + HANGUP_HINTS_ES):
-                            await do_hangup("text-fallback")
-                            return
-
-                    elif et == "error":
-                        log.error(f"OAI error: {evt}")
+                    elif t == "error":
+                        log.error(f"OpenAI error: {evt}")
 
                 elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     break
@@ -363,7 +316,7 @@ async def media(ws: WebSocket):
             log.info(f"openai_to_twilio ended: {e}")
 
     async def twilio_heartbeat():
-        # keep the media socket warm
+        # keep the media socket warm (avoid idle/proxy drops)
         try:
             while True:
                 await asyncio.sleep(15)
@@ -376,8 +329,10 @@ async def media(ws: WebSocket):
                         }))
         except asyncio.CancelledError:
             pass
+        except Exception:
+            pass
 
-    # Race tasks; cancel the rest when one ends
+    # Race tasks; cancel others when one ends
     t1 = asyncio.create_task(twilio_to_openai())
     t2 = asyncio.create_task(openai_to_twilio())
     t3 = asyncio.create_task(twilio_heartbeat())
