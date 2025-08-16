@@ -12,7 +12,7 @@ app = FastAPI()
 
 # ---------- ENV ----------
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "+10000000000")
+TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "+10000000000")  # your cell
 TW_SID          = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN        = os.getenv("TWILIO_AUTH_TOKEN", "")
 tw_client = Client(TW_SID, TW_TOKEN) if (TW_SID and TW_TOKEN) else None
@@ -34,14 +34,15 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist for {owner} in {loc}. "
-    "Default to ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
+    "Start in ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller.\n"
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request.\n"
     "TRANSFER PROTOCOL: If the caller clearly asks to speak to a person/the person in charge/Jeriel, "
     "say one line like “Absolutely—one moment while I connect you to the person in charge.” "
-    "Then in the TEXT channel output exactly <<TRANSFER>> (no other text). Do NOT say that token aloud."
+    "Then in the TEXT channel output exactly <<TRANSFER>> (no other text). Do NOT say that token aloud. "
+    "After you output <<TRANSFER>>, stop speaking."
 )
 
 def transfer_twiml(to_number: str, caller_id: str) -> str:
@@ -58,7 +59,7 @@ def transfer_twiml(to_number: str, caller_id: str) -> str:
 def health():
     return {"ok": True, "ai_enabled": bool(OPENAI_API_KEY)}
 
-# ---------- TWILIO VOICE WEBHOOK: minimal, force stream ----------
+# ---------- TWILIO VOICE WEBHOOK ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
@@ -68,14 +69,14 @@ async def voice(request: Request):
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
-# ---------- MEDIA STREAM (OpenAI Realtime) ----------
+# ---------- MEDIA STREAM ----------
 @app.websocket("/media")
 async def media(ws: WebSocket):
     if not OPENAI_API_KEY:
         await ws.close(); return
     await ws.accept()
 
-    # Wait for Twilio 'start'
+    # Wait for Twilio start
     stream_sid = call_sid = twilio_number = None
     try:
         while True:
@@ -91,7 +92,7 @@ async def media(ws: WebSocket):
         log.error(f"Twilio start wait failed: {e}")
         await ws.close(); return
 
-    # OpenAI Realtime WS
+    # OpenAI Realtime
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
     try:
         session = aiohttp.ClientSession()
@@ -115,12 +116,12 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # Configure session + immediate English greeting
+    # Configure session + greet
     try:
         await oai.send_json({
             "type": "session.update",
             "session": {
-                "turn_detection": {"type": "server_vad", "silence_duration_ms": 700},
+                "turn_detection": {"type": "server_vad", "silence_duration_ms": 900},
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
@@ -142,30 +143,59 @@ async def media(ws: WebSocket):
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # ---- State: safe commit + response gating ----
-    base64_bytes_since_last_commit = 0  # count base64 chars appended (proxy for audio duration)
-    BASE64_THRESHOLD = 1000            # ~100ms of μ-law 8k once base64-encoded
-    response_active = True             # greeting is in progress
+    # ---------- Turn-taking state ----------
+    base64_bytes_since_last_commit = 0
+    BASE64_THRESHOLD = 1000    # ~5 x 20ms frames of μ-law 8k when base64 encoded
+    response_active = True     # greeting in progress
+    pending_commit_task: asyncio.Task | None = None
 
-    # ---- Pumps ----
+    async def schedule_commit_after_delay():
+        """Debounce commit by ~150ms to let late audio frames arrive."""
+        nonlocal base64_bytes_since_last_commit, response_active, pending_commit_task
+        try:
+            await asyncio.sleep(0.15)
+            if base64_bytes_since_last_commit >= BASE64_THRESHOLD:
+                log.info(f"COMMIT {base64_bytes_since_last_commit}b")
+                await oai.send_json({"type": "input_audio_buffer.commit"})
+                base64_bytes_since_last_commit = 0
+                if not response_active:
+                    response_active = True
+                    await oai.send_json({
+                        "type": "response.create",
+                        "response": {"modalities": ["audio", "text"]}
+                    })
+            else:
+                # Not enough audio; skip
+                log.info(f"SKIP COMMIT (only {base64_bytes_since_last_commit}b)")
+                base64_bytes_since_last_commit = 0
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.error(f"commit task error: {e}")
+        finally:
+            pending_commit_task = None
+
+    # ---------- Pumps ----------
     async def twilio_to_openai():
-        nonlocal base64_bytes_since_last_commit
+        nonlocal base64_bytes_since_last_commit, pending_commit_task
         try:
             while True:
                 msg = await ws.receive_text()
                 data = json.loads(msg)
                 ev = data.get("event")
+
                 if ev == "media":
-                    payload = data["media"]["payload"] or ""
+                    payload = (data.get("media", {}).get("payload") or "")
                     base64_bytes_since_last_commit += len(payload)
                     await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
+
                 elif ev == "stop":
                     break
         except Exception as e:
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, base64_bytes_since_last_commit
+        nonlocal response_active, base64_bytes_since_last_commit, pending_commit_task
         try:
             while True:
                 msg = await oai.receive()
@@ -173,9 +203,9 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
-                    # Track response lifecycle
                     if t == "response.created":
                         response_active = True
+
                     elif t in ("response.completed", "response.failed", "response.canceled"):
                         response_active = False
                         if t == "response.completed":
@@ -189,7 +219,6 @@ async def media(ws: WebSocket):
                                 except Exception as e:
                                     log.error(f"Live transfer failed (completed): {e}")
 
-                    # Send audio back to Twilio
                     elif t == "response.audio.delta" and stream_sid:
                         await ws.send_text(json.dumps({
                             "event": "media",
@@ -197,26 +226,17 @@ async def media(ws: WebSocket):
                             "media": {"payload": evt["delta"]}
                         }))
 
-                    # Barge-in: wipe any queued TTS
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
+                        # Cancel any pending commit; caller resumed talking
+                        if pending_commit_task and not pending_commit_task.done():
+                            pending_commit_task.cancel()
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # On speech stop: only COMMIT if we buffered >= ~100ms since last commit
                     elif t == "input_audio_buffer.speech_stopped":
-                        if base64_bytes_since_last_commit >= BASE64_THRESHOLD:
-                            await oai.send_json({"type": "input_audio_buffer.commit"})
-                            base64_bytes_since_last_commit = 0
-                            if not response_active:
-                                response_active = True
-                                await oai.send_json({
-                                    "type": "response.create",
-                                    "response": {"modalities": ["audio", "text"]}
-                                })
-                        else:
-                            # Not enough audio—skip commit to avoid commit_empty
-                            base64_bytes_since_last_commit = 0
+                        # Schedule a debounced commit; don't do it immediately
+                        if pending_commit_task is None:
+                            pending_commit_task = asyncio.create_task(schedule_commit_after_delay())
 
-                    # Mid-stream transfer trigger (delta text)
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
                             try:
