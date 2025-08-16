@@ -3,6 +3,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Dial, Gather, Connect
 from twilio.rest import Client
+import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("elevara")
@@ -148,23 +149,18 @@ async def media(ws: WebSocket):
         log.error(f"Twilio start wait failed: {e}")
         await ws.close(); return
 
-    # lazy import (and version that supports tuples for extra_headers)
+    # 2) Connect to OpenAI Realtime via aiohttp
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "realtime=v1",
+    }
     try:
-        import websockets as ws_client
-    except ModuleNotFoundError:
-        log.error("websockets package missing")
-        if tw_client and call_sid:
-            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
-            except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
-        await ws.close(); return
-
-    oai_headers = [("Authorization", f"Bearer {OPENAI_API_KEY}"), ("OpenAI-Beta", "realtime=v1")]
-
-    # 2) Connect to OpenAI Realtime
-    try:
-        oai = await ws_client.connect(
+        session = aiohttp.ClientSession()
+        oai = await session.ws_connect(
             "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview",
-            extra_headers=oai_headers, ping_interval=20, ping_timeout=20, max_size=2**23,
+            headers=headers,
+            heartbeat=20,
+            max_msg_size=2**23,
         )
         log.info("Connected to OpenAI Realtime")
     except Exception as e:
@@ -177,12 +173,14 @@ async def media(ws: WebSocket):
     async def cleanup():
         try: await oai.close()
         except Exception: pass
+        try: await session.close()
+        except Exception: pass
         try: await ws.close()
         except Exception: pass
 
-    # 3) Configure session
+    # 3) Configure session + kick off first AI utterance
     try:
-        await oai.send(json.dumps({
+        await oai.send_json({
             "type": "session.update",
             "session": {
                 "turn_detection": {"type": "server_vad", "silence_duration_ms": 700},
@@ -192,15 +190,11 @@ async def media(ws: WebSocket):
                 "modalities": ["audio","text"],
                 "instructions": INSTRUCTIONS
             }
-        }))
-        # Kick off an audible greeting so caller hears AI immediately
-        await oai.send(json.dumps({
+        })
+        await oai.send_json({
             "type": "response.create",
-            "response": {
-                "modalities": ["audio"],
-                "instructions": "Greet briefly and ask how you can help."
-            }
-        }))
+            "response": {"modalities": ["audio"], "instructions": "Greet briefly and ask how you can help."}
+        })
     except Exception as e:
         log.error(f"OpenAI session.setup failed: {e}")
         if tw_client and call_sid:
@@ -216,10 +210,7 @@ async def media(ws: WebSocket):
                 data = json.loads(msg)
                 ev = data.get("event")
                 if ev == "media":
-                    await oai.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": data["media"]["payload"]
-                    }))
+                    await oai.send_json({"type": "input_audio_buffer.append", "audio": data["media"]["payload"]})
                 elif ev == "stop":
                     break
         except Exception as e:
@@ -228,37 +219,36 @@ async def media(ws: WebSocket):
     async def openai_to_twilio():
         try:
             while True:
-                raw = await oai.recv()
-                evt = json.loads(raw)
-                t = evt.get("type")
+                msg = await oai.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    evt = json.loads(msg.data)
+                    t = evt.get("type")
 
-                if t == "response.audio.delta" and stream_sid:
-                    await ws.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": evt["delta"]}
-                    }))
+                    if t == "response.audio.delta" and stream_sid:
+                        await ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": evt["delta"]}
+                        }))
 
-                elif t == "input_audio_buffer.speech_started" and stream_sid:
-                    # barge-in: stop any TTS in Twilio buffer
-                    await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
+                    elif t == "input_audio_buffer.speech_started" and stream_sid:
+                        await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                elif t in ("input_audio_buffer.speech_stopped", "input_audio_buffer.committed"):
-                    # ask model to reply to the last user turn
-                    await oai.send(json.dumps({
-                        "type": "response.create",
-                        "response": {"modalities": ["audio"]}
-                    }))
+                    elif t in ("input_audio_buffer.speech_stopped", "input_audio_buffer.committed"):
+                        await oai.send_json({"type": "response.create", "response": {"modalities": ["audio"]}})
 
-                elif t == "response.output_text.delta":
-                    if "<<TRANSFER>>" in evt.get("delta","") and call_sid and tw_client:
-                        try:
-                            tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
-                        except Exception as e:
-                            log.error(f"Live transfer failed: {e}")
+                    elif t == "response.output_text.delta":
+                        if "<<TRANSFER>>" in evt.get("delta","") and call_sid and tw_client:
+                            try:
+                                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
+                            except Exception as e:
+                                log.error(f"Live transfer failed: {e}")
 
-                elif t == "error":
-                    log.error(f"OpenAI error: {evt}")
+                    elif t == "error":
+                        log.error(f"OpenAI error: {evt}")
+
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
         except Exception as e:
             log.info(f"openai_to_twilio ended: {e}")
 
