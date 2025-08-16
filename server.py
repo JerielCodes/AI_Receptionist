@@ -34,7 +34,7 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist for {owner} in {loc}. "
-    "Start in ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
+    "Start in ENGLISH; switch to SPANISH only if the caller clearly speaks Spanish or asks. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller.\n"
@@ -64,6 +64,7 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
+    # Tiny TTS so Twilio hears immediate audio and keeps the stream happy
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
@@ -76,7 +77,7 @@ async def media(ws: WebSocket):
         await ws.close(); return
     await ws.accept()
 
-    # Wait for Twilio start
+    # Wait for Twilio 'start'
     stream_sid = call_sid = twilio_number = None
     try:
         while True:
@@ -104,8 +105,10 @@ async def media(ws: WebSocket):
     except Exception as e:
         log.error(f"OpenAI connect failed: {e}")
         if tw_client and call_sid:
-            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
-            except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
+            try:
+                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
+            except Exception as ee:
+                log.error(f"Transfer fallback failed: {ee}")
         await ws.close(); return
 
     async def cleanup():
@@ -116,12 +119,12 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # Configure session + greet (server VAD handles commits)
+    # Configure session + greet (let server VAD do all commits)
     try:
         await oai.send_json({
             "type": "session.update",
             "session": {
-                "turn_detection": {"type": "server_vad", "silence_duration_ms": 900},
+                "turn_detection": {"type": "server_vad", "silence_duration_ms": 1000},
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
@@ -139,12 +142,16 @@ async def media(ws: WebSocket):
     except Exception as e:
         log.error(f"OpenAI session.setup failed: {e}")
         if tw_client and call_sid:
-            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
-            except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
+            try:
+                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
+            except Exception as ee:
+                log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
     # ---------- State ----------
-    response_active = True  # greeting in progress
+    response_active = True            # greeting in progress
+    english_lock_turns = 2            # force English for first 2 user turns
+    pending_transfer = False
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
@@ -153,19 +160,17 @@ async def media(ws: WebSocket):
                 msg = await ws.receive_text()
                 data = json.loads(msg)
                 ev = data.get("event")
-
                 if ev == "media":
                     payload = (data.get("media", {}).get("payload") or "")
-                    # just append; no manual commit in server_vad mode
+                    # Only append; NO manual commit when using server_vad
                     await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
-
                 elif ev == "stop":
                     break
         except Exception as e:
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active
+        nonlocal response_active, english_lock_turns, pending_transfer
         try:
             while True:
                 msg = await oai.receive()
@@ -181,13 +186,15 @@ async def media(ws: WebSocket):
                         if t == "response.completed":
                             out = evt.get("response", {}).get("output_text", [])
                             joined = " ".join(x or "" for x in out)
-                            if "<<TRANSFER>>" in joined and call_sid and tw_client:
-                                try:
-                                    tw_client.calls(call_sid).update(
-                                        twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
-                                    )
-                                except Exception as e:
-                                    log.error(f"Live transfer failed (completed): {e}")
+                            if "<<TRANSFER>>" in joined:
+                                pending_transfer = True
+                                if call_sid and tw_client:
+                                    try:
+                                        tw_client.calls(call_sid).update(
+                                            twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
+                                        )
+                                    except Exception as e:
+                                        log.error(f"Live transfer failed (completed): {e}")
 
                     elif t == "response.audio.delta" and stream_sid:
                         await ws.send_text(json.dumps({
@@ -197,26 +204,39 @@ async def media(ws: WebSocket):
                         }))
 
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
-                        # cancel audio playback for barge-in
+                        # Barge-in: clear any queued TTS
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
                     elif t == "input_audio_buffer.committed":
-                        # server VAD has committed the user turn; request a response if idle
+                        # OpenAI's server VAD decided the caller finished speaking.
                         if not response_active:
                             response_active = True
-                            await oai.send_json({
-                                "type": "response.create",
-                                "response": {"modalities": ["audio", "text"]}
-                            })
+                            if english_lock_turns > 0:
+                                english_lock_turns -= 1
+                                await oai.send_json({
+                                    "type": "response.create",
+                                    "response": {
+                                        "modalities": ["audio", "text"],
+                                        "instructions": "Respond in ENGLISH."
+                                    }
+                                })
+                            else:
+                                await oai.send_json({
+                                    "type": "response.create",
+                                    "response": {"modalities": ["audio", "text"]}
+                                })
 
                     elif t == "response.output_text.delta":
-                        if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
-                            try:
-                                tw_client.calls(call_sid).update(
-                                    twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
-                                )
-                            except Exception as e:
-                                log.error(f"Live transfer failed (delta): {e}")
+                        # Mid-stream transfer catch (token appears during generation)
+                        if "<<TRANSFER>>" in (evt.get("delta") or ""):
+                            pending_transfer = True
+                            if call_sid and tw_client:
+                                try:
+                                    tw_client.calls(call_sid).update(
+                                        twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
+                                    )
+                                except Exception as e:
+                                    log.error(f"Live transfer failed (delta): {e}")
 
                     elif t == "error":
                         log.error(f"OpenAI error: {evt}")
