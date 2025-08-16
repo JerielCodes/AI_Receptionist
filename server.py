@@ -35,27 +35,22 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist for {owner} in {loc}. "
     "Default to ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
-    "Never start in any other language. "
-    "Tone: warm, professional, friendly, emotion-aware. "
-    "Keep replies to 1–2 short sentences unless asked; mirror caller language (EN/ES). "
-    "Use light humor only if the caller jokes about AI. "
-    f"Value props: {vals}. Offer a brief demo explanation; then ask how you can help. "
-    f"Offer the trial when interest is shown: {trial}. "
-    "NEVER invent business facts. If unsure, say so and offer to connect the caller.\n"
-    "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. "
-    "(3) Transfer to a human on request.\n"
-    "TRANSFER PROTOCOL: If caller clearly asks to speak to a person / the person in charge / Jeriel, "
-    "first say one line like “Absolutely—one moment while I connect you to the person in charge.” "
-    "Then in the TEXT stream only output exactly <<TRANSFER>> (no other text). Do NOT say <<TRANSFER>> aloud."
+    "Tone: warm, professional, friendly, emotion-aware. 1–2 concise sentences unless asked. "
+    f"Value props: {vals}. Offer the trial if interest is shown: {trial}. "
+    "Never invent business facts; if unsure, say so and offer to connect the caller.\n"
+    "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request.\n"
+    "TRANSFER PROTOCOL: If the caller clearly asks to speak to a person/the person in charge/Jeriel, "
+    "say one line like “Absolutely—one moment while I connect you to the person in charge.” "
+    "Then in the TEXT channel output exactly <<TRANSFER>> (no other text). Do NOT say that token aloud."
 )
 
 def transfer_twiml(to_number: str, caller_id: str) -> str:
     vr = VoiceResponse()
     vr.say("Connecting you now.")
-    dial_kwargs = {"answer_on_bridge": True}
+    kwargs = {"answer_on_bridge": True}
     if caller_id and caller_id.startswith("+"):
-        dial_kwargs["caller_id"] = caller_id
-    d = Dial(**dial_kwargs); d.number(to_number); vr.append(d)
+        kwargs["caller_id"] = caller_id
+    d = Dial(**kwargs); d.number(to_number); vr.append(d)
     return str(vr)
 
 # ---------- HEALTH ----------
@@ -63,14 +58,15 @@ def transfer_twiml(to_number: str, caller_id: str) -> str:
 def health():
     return {"ok": True, "ai_enabled": bool(OPENAI_API_KEY)}
 
-# ---------- TWILIO VOICE WEBHOOK (force media stream) ----------
+# ---------- TWILIO VOICE WEBHOOK: minimal, force stream ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
+    # Tiny spoken line so caller hears something instantly
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
-    log.info(f"Returning TwiML with stream URL: wss://{host}/media")
+    log.info(f"Returning TwiML with stream URL: wss://{host}/media}")
     return PlainTextResponse(str(vr), media_type="application/xml")
 
 # ---------- MEDIA STREAM (OpenAI Realtime) ----------
@@ -80,7 +76,7 @@ async def media(ws: WebSocket):
         await ws.close(); return
     await ws.accept()
 
-    # Wait for Twilio start event
+    # Wait for Twilio 'start' (get callSid & our Twilio number)
     stream_sid = call_sid = twilio_number = None
     try:
         while True:
@@ -96,7 +92,7 @@ async def media(ws: WebSocket):
         log.error(f"Twilio start wait failed: {e}")
         await ws.close(); return
 
-    # Connect to OpenAI Realtime
+    # Connect to OpenAI Realtime (audio <-> audio+text)
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"}
     try:
         session = aiohttp.ClientSession()
@@ -120,7 +116,7 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # OpenAI session config + greeting (EN by default)
+    # Configure session + immediate greeting (keeps Twilio alive)
     try:
         await oai.send_json({
             "type": "session.update",
@@ -147,21 +143,20 @@ async def media(ws: WebSocket):
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # ---- State (no commits; request replies only when real audio seen) ----
-    chunks_since_last_speech = 0
-    MIN_CHUNKS_FOR_REPLY = 5          # ~100ms if ~20ms chunks
-    response_active = True            # greeting already created
+    # ---- State: reply/commit control ----
+    appended_since_last_commit = False  # True only if we've appended real caller audio
+    response_active = True              # greeting is in progress
 
     # ---- Pumps ----
     async def twilio_to_openai():
-        nonlocal chunks_since_last_speech
+        nonlocal appended_since_last_commit
         try:
             while True:
                 msg = await ws.receive_text()
                 data = json.loads(msg)
                 ev = data.get("event")
                 if ev == "media":
-                    chunks_since_last_speech += 1
+                    appended_since_last_commit = True
                     await oai.send_json({
                         "type": "input_audio_buffer.append",
                         "audio": data["media"]["payload"]  # base64 μ-law 8k
@@ -172,7 +167,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, chunks_since_last_speech
+        nonlocal response_active, appended_since_last_commit
         try:
             while True:
                 msg = await oai.receive()
@@ -180,9 +175,9 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
+                    # Track response lifecycle
                     if t == "response.created":
                         response_active = True
-
                     elif t in ("response.completed", "response.failed", "response.canceled"):
                         response_active = False
                         if t == "response.completed":
@@ -196,6 +191,7 @@ async def media(ws: WebSocket):
                                 except Exception as e:
                                     log.error(f"Live transfer failed (completed): {e}")
 
+                    # Send audio back to Twilio
                     elif t == "response.audio.delta" and stream_sid:
                         await ws.send_text(json.dumps({
                             "event": "media",
@@ -203,20 +199,24 @@ async def media(ws: WebSocket):
                             "media": {"payload": evt["delta"]}
                         }))
 
+                    # Barge-in: wipe any queued TTS
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
-                        # barge-in: clear any queued TTS
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
+                    # Only commit if we actually appended caller audio
                     elif t == "input_audio_buffer.speech_stopped":
-                        # Only ask for a reply if we've actually seen enough input audio
-                        if chunks_since_last_speech >= MIN_CHUNKS_FOR_REPLY and not response_active:
-                            response_active = True
-                            await oai.send_json({
-                                "type": "response.create",
-                                "response": {"modalities": ["audio", "text"]}
-                            })
-                        chunks_since_last_speech = 0
+                        if appended_since_last_commit:
+                            await oai.send_json({"type": "input_audio_buffer.commit"})
+                            appended_since_last_commit = False
+                            # Ask for a reply only if none is active
+                            if not response_active:
+                                response_active = True
+                                await oai.send_json({
+                                    "type": "response.create",
+                                    "response": {"modalities": ["audio", "text"]}
+                                })
 
+                    # Mid-stream transfer if the token appears in the text delta
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
                             try:
