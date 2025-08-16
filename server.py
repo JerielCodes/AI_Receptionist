@@ -37,7 +37,7 @@ INSTRUCTIONS = (
     "Default to ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
     "Never start in any other language. "
     "Tone: warm, professional, friendly, emotion-aware. "
-    "Keep replies to 1–2 short sentences unless asked; mirror the caller’s language (EN/ES). "
+    "Keep replies to 1–2 short sentences unless asked; mirror caller language (EN/ES). "
     "Use light humor only if the caller jokes about AI. "
     f"Value props: {vals}. Offer a brief demo explanation; then ask how you can help. "
     f"Offer the trial when interest is shown: {trial}. "
@@ -147,21 +147,21 @@ async def media(ws: WebSocket):
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # ---- State to avoid empty commits & double responses ----
-    chunk_count = 0            # number of audio chunks since last commit
-    MIN_CHUNKS_FOR_COMMIT = 5  # ~100ms at 20ms per chunk
-    response_active = True     # greeting already created
+    # ---- State (no commits; request replies only when real audio seen) ----
+    chunks_since_last_speech = 0
+    MIN_CHUNKS_FOR_REPLY = 5          # ~100ms if ~20ms chunks
+    response_active = True            # greeting already created
 
     # ---- Pumps ----
     async def twilio_to_openai():
-        nonlocal chunk_count
+        nonlocal chunks_since_last_speech
         try:
             while True:
                 msg = await ws.receive_text()
                 data = json.loads(msg)
                 ev = data.get("event")
                 if ev == "media":
-                    chunk_count += 1
+                    chunks_since_last_speech += 1
                     await oai.send_json({
                         "type": "input_audio_buffer.append",
                         "audio": data["media"]["payload"]  # base64 μ-law 8k
@@ -172,7 +172,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, chunk_count
+        nonlocal response_active, chunks_since_last_speech
         try:
             while True:
                 msg = await oai.receive()
@@ -208,21 +208,14 @@ async def media(ws: WebSocket):
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
                     elif t == "input_audio_buffer.speech_stopped":
-                        # Only commit if we actually buffered ~100ms+ of audio
-                        if chunk_count >= MIN_CHUNKS_FOR_COMMIT:
-                            await oai.send_json({"type": "input_audio_buffer.commit"})
-                            chunk_count = 0
-                        else:
-                            # ignore tiny/no audio to avoid commit_empty
-                            chunk_count = 0
-
-                    elif t == "input_audio_buffer.committed":
-                        if not response_active:
+                        # Only ask for a reply if we've actually seen enough input audio
+                        if chunks_since_last_speech >= MIN_CHUNKS_FOR_REPLY and not response_active:
                             response_active = True
                             await oai.send_json({
                                 "type": "response.create",
                                 "response": {"modalities": ["audio", "text"]}
                             })
+                        chunks_since_last_speech = 0
 
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
