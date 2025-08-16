@@ -1,5 +1,5 @@
 # server.py
-import os, json, asyncio, logging, aiohttp
+import os, re, json, asyncio, logging, aiohttp
 from contextlib import suppress
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
@@ -17,12 +17,22 @@ TW_SID          = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN        = os.getenv("TWILIO_AUTH_TOKEN", "")
 tw_client = Client(TW_SID, TW_TOKEN) if (TW_SID and TW_TOKEN) else None
 
+E164 = re.compile(r"^\+[1-9]\d{7,14}$")
+
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY missing -> AI disabled.")
+if not tw_client:
+    log.warning("Twilio creds missing -> transfer/hangup disabled (tw_client=None).")
+if "YOURCELLPHONE" in TRANSFER_NUMBER or not E164.match(TRANSFER_NUMBER):
+    log.warning("TRANSFER_NUMBER invalid or placeholder; set E.164 like +1267...")
+
 # ---------- BUSINESS PROMPT ----------
 def load_kb():
     try:
         with open("business.json", "r") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        log.warning(f"business.json not loaded: {e}")
         return {}
 
 KB   = load_kb()
@@ -60,13 +70,19 @@ def transfer_twiml(to_number: str, caller_id: str | None) -> str:
 # ---------- HEALTH ----------
 @app.get("/")
 def health():
-    return {"ok": True, "ai_enabled": bool(OPENAI_API_KEY)}
+    return {
+        "ok": bool(OPENAI_API_KEY),
+        "twilio_ready": bool(tw_client),
+        "transfer_ready": E164.match(TRANSFER_NUMBER) is not None,
+        "transfer_number": TRANSFER_NUMBER,
+    }
 
 # ---------- TWILIO VOICE WEBHOOK ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
+    # Small prompt so Twilio streams immediately
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
@@ -107,8 +123,11 @@ async def media(ws: WebSocket):
     except Exception as e:
         log.error(f"OpenAI connect failed: {e}")
         if tw_client and call_sid:
-            with suppress(Exception):
-                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
+            try:
+                res = tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
+                log.info(f"Fallback transfer issued. callSid={res.sid} status={res.status}")
+            except Exception as ee:
+                log.exception(f"Transfer fallback failed: {ee}")
         await ws.close(); return
 
     async def cleanup():
@@ -175,8 +194,11 @@ async def media(ws: WebSocket):
     except Exception as e:
         log.error(f"OpenAI session.setup failed: {e}")
         if tw_client and call_sid:
-            with suppress(Exception):
-                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
+            try:
+                res = tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
+                log.info(f"Fallback transfer issued. callSid={res.sid} status={res.status}")
+            except Exception as ee:
+                log.exception(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
     # ---------- State ----------
@@ -235,6 +257,7 @@ async def media(ws: WebSocket):
                     elif t == "input_audio_buffer.speech_stopped":
                         if base64_since_commit >= BASE64_THRESHOLD:
                             await oai.send_json({"type": "input_audio_buffer.commit"})
+                            log.info(f"COMMIT {base64_since_commit}b")
                             base64_since_commit = 0
                             req = {
                                 "type": "response.create",
@@ -249,7 +272,9 @@ async def media(ws: WebSocket):
                                 req["response"]["instructions"] = "Respond in ENGLISH."
                             await oai.send_json(req)
                         else:
-                            base64_since_commit = 0  # ignore ultra-short noise to avoid commit_empty
+                            # ignore short noise to avoid commit_empty
+                            log.info(f"Skip commit (buffer {base64_since_commit}b < {BASE64_THRESHOLD}b)")
+                            base64_since_commit = 0
 
                     # ---------- TOOL CALLS ----------
                     elif t == "response.output_item.added":
@@ -273,32 +298,43 @@ async def media(ws: WebSocket):
                                 args = json.loads(item.get("arguments") or info.get("args") or "{}")
                             except Exception:
                                 args = {}
-
                             if name == "transfer_call":
                                 target = args.get("to") or TRANSFER_NUMBER
-                                log.info(f"TOOL transfer_call -> {target}")
-                                if tw_client and call_sid:
-                                    with suppress(Exception):
-                                        tw_client.calls(call_sid).update(
+                                if not E164.match(target):
+                                    log.error(f"Transfer aborted: invalid number {target!r}")
+                                elif not (tw_client and call_sid):
+                                    log.error("Transfer aborted: Twilio client not ready.")
+                                else:
+                                    try:
+                                        res = tw_client.calls(call_sid).update(
                                             twiml=transfer_twiml(target, twilio_number)
                                         )
+                                        log.info(f"TOOL transfer_call -> {target} (sid={res.sid}, status={res.status})")
+                                    except Exception as e:
+                                        log.exception(f"Live transfer failed: {e}")
 
                             elif name == "end_call":
-                                log.info("TOOL end_call")
-                                if tw_client and call_sid:
-                                    with suppress(Exception):
-                                        tw_client.calls(call_sid).update(status="completed")
+                                if not (tw_client and call_sid):
+                                    log.error("Hangup aborted: Twilio client not ready.")
+                                else:
+                                    try:
+                                        res = tw_client.calls(call_sid).update(status="completed")
+                                        log.info(f"TOOL end_call -> completed (sid={res.sid}, status={res.status})")
+                                    except Exception as e:
+                                        log.exception(f"Hangup failed: {e}")
 
-                    # Optional: tiny text fallback if tool somehow didn't fire
+                    # Optional: tiny text fallback if tool hint appears
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
                         if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now"]):
-                            log.info("Fallback transfer hint from text delta.")
                             if tw_client and call_sid:
-                                with suppress(Exception):
-                                    tw_client.calls(call_sid).update(
+                                try:
+                                    res = tw_client.calls(call_sid).update(
                                         twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number)
                                     )
+                                    log.info(f"Fallback transfer triggered (sid={res.sid}, status={res.status})")
+                                except Exception as e:
+                                    log.exception(f"Fallback transfer failed: {e}")
 
                     elif t == "error":
                         log.error(f"OpenAI error: {evt}")
@@ -323,8 +359,6 @@ async def media(ws: WebSocket):
                             "mark": {"name": "hb"}
                         }))
         except asyncio.CancelledError:
-            pass
-        except Exception:
             pass
 
     # Race tasks; cancel others when one ends
