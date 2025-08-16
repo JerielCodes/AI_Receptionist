@@ -7,17 +7,16 @@ import aiohttp
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("elevara")
-
 app = FastAPI()
 
-# --- Env ---
-TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "+10000000000")   # e.g. +12672134362
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")                 # add to enable AI mode
+# ----- Env -----
+TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "+10000000000")
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 TW_SID          = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN        = os.getenv("TWILIO_AUTH_TOKEN", "")
 tw_client = Client(TW_SID, TW_TOKEN) if (TW_SID and TW_TOKEN) else None
 
-# --- Load business knowledge ---
+# ----- Load business knowledge (optional file) -----
 def load_kb():
     try:
         with open("business.json", "r") as f:
@@ -30,42 +29,34 @@ def kb_to_instructions(kb: dict) -> str:
     brand = kb.get("brand", "Elevara")
     owner = kb.get("owner_name", "Jeriel")
     loc   = kb.get("location", "Philadelphia, PA")
-    langs = ", ".join(kb.get("languages", ["English"]))
-    vals  = " • ".join(kb.get("value_props", []))
+    langs = ", ".join(kb.get("languages", ["English","Spanish"]))
+    vals  = " • ".join(kb.get("value_props", [])) or "24/7 AI receptionist • instant answers • books & transfers calls"
     pricing_line = kb.get("pricing", {}).get("line", "")
-    trial_offer  = kb.get("trial_offer", "")
+    trial_offer  = kb.get("trial_offer", "We offer a one-week free trial; install/uninstall is free.")
     faqs = " ".join([f"Q: {x.get('q','')} A: {x.get('a','')}" for x in kb.get("faqs", [])])
-    qqs  = " ".join([f"{i+1}. {q}" for i, q in enumerate(kb.get("qualifying_questions", []))])
-    human_alias = " or ".join(kb.get("transfer", {}).get("phrase_for_human", ["the person in charge"]))
-
+    qqs  = " ".join([f"{i+1}. {q}" for i, q in enumerate(kb.get("qualifying_questions", ["What type of business?","Best call times?"]))])
     return (
         f"You are the {brand} AI receptionist for {owner} in {loc}. "
-        f"Speak {langs}. Tone: warm, professional, friendly; emotion-aware. "
-        f"Use light humor only if the caller jokes about AI, then pivot back.\n"
-        "STYLE: Sound like a real receptionist (not scripted). Keep replies to 1–2 sentences unless asked. "
-        "Vary phrasing naturally; mirror the caller’s energy and language (EN/ES).\n"
+        f"Speak {langs}. Tone: warm, professional, friendly, emotion-aware. "
+        "Keep replies to 1–2 sentences unless asked; mirror the caller’s language (EN/ES). "
+        "Use light humor only if the caller jokes about AI.\n"
         f"VALUE: {vals}\n"
         f"PRICING/TRIAL: {pricing_line} | {trial_offer}\n"
         f"FAQs: {faqs}\n"
-        f"QUALIFY (ask 1–2 only if relevant): {qqs}\n"
-        "FACTS: Never invent details (prices, capabilities, timelines, policies). "
-        "If unsure or not in your knowledge, say you’re not certain and offer to connect the caller.\n"
-        "GOALS: (1) Explain benefits briefly and answer questions. "
-        "(2) Offer to book an installation/demo. "
-        "(3) Transfer to a human on request.\n"
-        "TRANSFER: If the caller clearly asks to speak to a human / the person in charge / Jeriel:\n"
-        "- AUDIO to caller: say one natural line like “Absolutely—one moment while I connect you to the person in charge.”\n"
-        "- TEXT stream only: output ONLY the token <<TRANSFER>> (no other text). Do NOT say <<TRANSFER>> aloud.\n"
+        f"QUALIFY (ask briefly if useful): {qqs}\n"
+        "FACTS: Never invent details. If unsure, say so and offer to connect the caller.\n"
+        "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request.\n"
+        "TRANSFER PROTOCOL: If the caller clearly asks to speak to a human/the person in charge/Jeriel, "
+        "say one natural line like “Absolutely—one moment while I connect you to the person in charge.” "
+        "Then in the TEXT stream only, output exactly <<TRANSFER>> (no other text). Do NOT say <<TRANSFER>> aloud."
     )
-
 INSTRUCTIONS = kb_to_instructions(KB)
 
-# --- Helpers ---
 def should_transfer(said: str, digits: str) -> bool:
     said = (said or "").lower()
     digits = (digits or "").strip()
-    keys = KB.get("transfer", {}).get("triggers_keywords", [])
-    keys = [k.lower() for k in keys] + ["representative", "operator"]
+    keys = [k.lower() for k in KB.get("transfer", {}).get("triggers_keywords", [])]
+    keys += ["transfer","human","person in charge","manager","representative","operator","talk to jeriel","press 1"]
     return digits == "1" or any(k in said for k in keys)
 
 def transfer_twiml(to_number: str, caller_id: str) -> str:
@@ -74,17 +65,17 @@ def transfer_twiml(to_number: str, caller_id: str) -> str:
     if rec.get("enabled"):
         vr.say(rec.get("notice_en", "This call may be recorded to improve service quality."))
     vr.say("Connecting you now.")
-    kwargs = {"answer_on_bridge": True}
+    d = Dial(answer_on_bridge=True)
     if caller_id and caller_id.startswith("+"):
-        kwargs["caller_id"] = caller_id  # use your Twilio DID (trial-safe)
-    d = Dial(**kwargs); d.number(to_number); vr.append(d)
+        d = Dial(answer_on_bridge=True, caller_id=caller_id)
+    d.number(to_number); vr.append(d)
     return str(vr)
 
 @app.get("/")
 def health():
     return {"ok": True, "ai_enabled": bool(OPENAI_API_KEY)}
 
-# --- Entry: voice webhook (works in both modes) ---
+# ---------- Voice webhook ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
     form = await request.form()
@@ -99,10 +90,10 @@ async def voice(request: Request):
         vr = VoiceResponse()
         rec = KB.get("recording", {})
         if rec.get("enabled"):
-            vr.say(rec.get("notice_en"))
+            vr.say(rec.get("notice_en", "This call may be recorded to improve service quality."))
         vr.say(greet_en)
         c = Connect(); c.stream(url=f"wss://{host}/media"); vr.append(c)
-        # Fallback gather to keep call alive if stream ends early
+        # Fallback gather in case stream ends
         g = Gather(input="speech dtmf", num_digits=1, timeout=5, action="/twilio/voice", method="POST")
         g.say("If you need help, say 'transfer' or press 1.")
         vr.append(g)
@@ -112,9 +103,6 @@ async def voice(request: Request):
             return PlainTextResponse(transfer_twiml(TRANSFER_NUMBER, twilio_number),
                                      media_type="application/xml")
         vr = VoiceResponse()
-        rec = KB.get("recording", {})
-        if rec.get("enabled"):
-            vr.say(rec.get("notice_en"))
         g1 = Gather(input="speech dtmf", num_digits=1, timeout=4, action="/twilio/voice", method="POST")
         g1.say(greet_en + " Say 'transfer' or press 1 to talk to the person in charge.")
         vr.append(g1)
@@ -124,7 +112,7 @@ async def voice(request: Request):
         vr.append(g2); vr.say("Goodbye.")
         return PlainTextResponse(str(vr), media_type="application/xml")
 
-# --- Media Streams (AI mode) ---
+# ---------- Media Streams (AI mode) ----------
 @app.websocket("/media")
 async def media(ws: WebSocket):
     if not OPENAI_API_KEY:
@@ -132,8 +120,6 @@ async def media(ws: WebSocket):
     await ws.accept()
 
     stream_sid, call_sid = None, None
-
-    # 1) Wait for Twilio 'start' so we have callSid
     try:
         first = await asyncio.wait_for(ws.receive_text(), timeout=5)
         data0 = json.loads(first)
@@ -146,7 +132,6 @@ async def media(ws: WebSocket):
         logging.error(f"Twilio start wait failed: {e}")
         await ws.close(); return
 
-    # 2) Connect to OpenAI Realtime via aiohttp
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
@@ -175,7 +160,7 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # 3) Configure session + kick off first AI utterance
+    # Configure session and send a short greeting
     try:
         await oai.send_json({
             "type": "session.update",
@@ -190,7 +175,7 @@ async def media(ws: WebSocket):
         })
         await oai.send_json({
             "type": "response.create",
-            "response": {"modalities": ["audio"], "instructions": "Greet briefly and ask how you can help."}
+            "response": {"modalities": ["audio","text"], "instructions": "Greet briefly and ask how you can help."}
         })
     except Exception as e:
         logging.error(f"OpenAI session.setup failed: {e}")
@@ -199,7 +184,6 @@ async def media(ws: WebSocket):
             except Exception as ee: logging.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # 4) Bridge audio both ways
     async def twilio_to_openai():
         try:
             while True:
@@ -229,27 +213,32 @@ async def media(ws: WebSocket):
                         }))
 
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
+                        # barge-in: stop current TTS
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    elif t in ("input_audio_buffer.speech_stopped", "input_audio_buffer.committed"):
-                        await oai.send_json({"type": "response.create", "response": {"modalities": ["audio"]}})
+                    elif t == "input_audio_buffer.speech_stopped":
+                        # close the chunk and ask the model to respond
+                        await oai.send_json({"type": "input_audio_buffer.commit"})
+                        await oai.send_json({"type": "response.create",
+                                             "response": {"modalities": ["audio","text"]}})
 
-                    # === Transfer detection (robust) ===
+                    elif t == "input_audio_buffer.committed":
+                        # (sometimes VAD will emit committed; be robust)
+                        await oai.send_json({"type": "response.create",
+                                             "response": {"modalities": ["audio","text"]}})
+
+                    # ---- Transfer detection ----
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in evt.get("delta","") and call_sid and tw_client:
-                            try:
-                                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
-                            except Exception as e:
-                                logging.error(f"Live transfer failed (delta): {e}")
+                            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
+                            except Exception as e: logging.error(f"Live transfer failed (delta): {e}")
 
                     elif t == "response.completed":
                         out = evt.get("response", {}).get("output_text", [])
                         joined = " ".join(x or "" for x in out)
                         if "<<TRANSFER>>" in joined and call_sid and tw_client:
-                            try:
-                                tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
-                            except Exception as e:
-                                logging.error(f"Live transfer failed (completed): {e}")
+                            try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, ""))
+                            except Exception as e: logging.error(f"Live transfer failed (completed): {e}")
 
                     elif t == "error":
                         logging.error(f"OpenAI error: {evt}")
