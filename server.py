@@ -186,11 +186,14 @@ async def media(ws: WebSocket):
                 tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER))
         await cleanup(); return
 
-    # ---------- State (for both event shapes) ----------
-    output_items: dict[str, dict] = {}   # id -> {"name": str, "args": str}
-    fn_calls: dict[str, dict] = {}       # call_id/id -> {"name": str, "args": str}
+    # ---------- State ----------
+    # Mapping for BOTH event families:
+    #   A) response.output_item.added -> item: {type:"function_call", call_id, name}
+    #   B) response.function_call_arguments.delta/done -> {call_id, arguments}
+    call_map: dict[str, dict] = {}   # call_id -> {"name": str, "args": str}
+    user_buf: list[str] = []         # accumulate user transcript per turn
 
-    # ---------- Actions ----------
+    # ---------- Twilio actions ----------
     def do_transfer(reason: str | None = None, to: str | None = None):
         target = to or TRANSFER_NUMBER
         if not (tw_client and call_sid and valid_e164(target)):
@@ -208,11 +211,17 @@ async def media(ws: WebSocket):
         with suppress(Exception):
             tw_client.calls(call_sid).update(status="completed")
 
-    TRANSFER_HINTS = [
-        "connecting you", "let me connect", "i'll transfer you", "transfer you now",
-        "connect you now", "patch you through", "transfer now"
-    ]
-    HANGUP_HINTS = ["ending the call", "goodbye", "bye for now"]
+    # Server-side fallback NLU for user utterances (EN + ES)
+    TRANSFER_PAT = re.compile(
+        r"(transfer|connect|patch|talk\s+to|speak\s+to|human|agent|representative|manager|owner|person\s+in\s+charge|someone|live\s+agent|operator|jeriel|person)\b"
+        r"|(\btransferir\b|\bconectar\b|\bagente\b|\bhumano\b|\bpersona\b|\bencargad[oa]\b|\bdueñ[oa]\b|\boperador[ae]?\b)",
+        re.IGNORECASE
+    )
+    HANGUP_PAT = re.compile(
+        r"(hang\s*up|end\s+the\s+call|that'?s\s+all|that is all|bye|good\s*bye|not\s+interested|we'?re\s+done)"
+        r"|(\bcolgar\b|\bterminar\b.*\bllamad[ao]?\b|\bad(i|í)os\b|\bno\s+interesad[oa]\b)",
+        re.IGNORECASE
+    )
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
@@ -244,9 +253,11 @@ async def media(ws: WebSocket):
                     t = evt.get("type")
                     log.info(f"OAI EVT: {t}")
 
-                    # --- Show transcripts (debug) ---
+                    # ===== Debug transcripts =====
                     if t == "conversation.item.input_audio_transcription.delta":
-                        log.info(f"USER>> {evt.get('delta')}")
+                        delta = evt.get("delta") or ""
+                        user_buf.append(delta)
+                        log.info(f"USER>> {delta}")
                     if t == "response.audio_transcript.delta":
                         log.info(f"ASSISTANT>> {evt.get('delta')}")
 
@@ -266,66 +277,73 @@ async def media(ws: WebSocket):
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # --------- PATH A: output_item.* tool events ----------
+                    # ===== User utterance completed → server-side fallback intent =====
+                    elif t == "conversation.item.input_audio_transcription.completed":
+                        text = "".join(user_buf).strip()
+                        user_buf.clear()
+                        if text:
+                            low = text.lower()
+                            if TRANSFER_PAT.search(low):
+                                log.info(f"SERVER-INTENT: transfer (from user text): {text!r}")
+                                do_transfer(reason="user_requested_transfer")
+                            elif HANGUP_PAT.search(low):
+                                log.info(f"SERVER-INTENT: hangup (from user text): {text!r}")
+                                do_hangup(reason="user_requested_hangup")
+
+                    # ===== PATH A: output_item.* announces the function + call_id =====
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
-                        if item.get("type") in ("tool_call", "function_call"):
-                            output_items[item["id"]] = {"name": item.get("name"), "args": ""}
+                        if item.get("type") == "function_call":
+                            call_id = item.get("call_id")
+                            name    = item.get("name")
+                            if call_id:
+                                entry = call_map.setdefault(call_id, {"name": None, "args": ""})
+                                if name: entry["name"] = name
+                                log.info(f"FUNC ANNOUNCED: call_id={call_id} name={name}")
 
-                    elif t == "response.output_item.delta":
-                        item = evt.get("item", {})
-                        iid = item.get("id")
-                        if iid in output_items and "arguments" in item:
-                            output_items[iid]["args"] += item["arguments"]
+                    # ===== PATH B: function_call_arguments.* streams the args by call_id =====
+                    elif t == "response.function_call_arguments.delta":
+                        cid   = evt.get("call_id")
+                        delta = evt.get("arguments", "")
+                        if cid:
+                            entry = call_map.setdefault(cid, {"name": None, "args": ""})
+                            entry["args"] += delta
 
-                    elif t == "response.output_item.completed":
-                        item = evt.get("item", {})
-                        iid  = item.get("id")
-                        info = output_items.pop(iid, None)
-                        if info:
+                    elif t == "response.function_call_arguments.done":
+                        cid = evt.get("call_id")
+                        if cid:
+                            info = call_map.pop(cid, {"name": None, "args": ""})
                             name = info.get("name")
+                            raw  = info.get("args") or ""
                             try:
-                                args = json.loads(item.get("arguments") or info.get("args") or "{}")
+                                args = json.loads(raw or "{}")
                             except Exception:
+                                log.error(f"Bad JSON for function args: {raw!r}")
                                 args = {}
-                            log.info(f"TOOL (output_item) COMPLETE: {name} args={args}")
+                            log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
                             if name == "transfer_call":
                                 do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
                             elif name == "end_call":
                                 do_hangup(reason=args.get("reason"))
+                            else:
+                                # If name was missing, apply heuristic from recent assistant text
+                                last_hint = (evt.get("response", {}) or {}).get("output_text", [])
+                                if last_hint:
+                                    joined = " ".join(last_hint).lower()
+                                    if "transfer" in joined or "connect" in joined:
+                                        log.info("Heuristic: missing name but text suggests transfer.")
+                                        do_transfer()
+                                    elif "end the call" in joined or "hang up" in joined:
+                                        log.info("Heuristic: missing name but text suggests hangup.")
+                                        do_hangup()
 
-                    # --------- PATH B: function_call_arguments.* events ----------
-                    elif t == "response.function_call_arguments.delta":
-                        cid   = evt.get("call_id") or evt.get("id") or "unknown"
-                        name  = evt.get("name")
-                        delta = evt.get("arguments", "")
-                        fc = fn_calls.setdefault(cid, {"name": name, "args": ""})
-                        if name: fc["name"] = name
-                        fc["args"] += delta
-
-                    elif t == "response.function_call_arguments.done":
-                        cid  = evt.get("call_id") or evt.get("id") or "unknown"
-                        info = fn_calls.pop(cid, {"name": evt.get("name"), "args": evt.get("arguments", "")})
-                        name = info.get("name")
-                        raw  = info.get("args", "") or ""
-                        try:
-                            args = json.loads(raw or "{}")
-                        except Exception:
-                            log.error(f"Bad JSON for function args: {raw!r}")
-                            args = {}
-                        log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
-                        if name == "transfer_call":
-                            do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
-                        elif name == "end_call":
-                            do_hangup(reason=args.get("reason"))
-
-                    # --------- TEXT FALLBACKS ----------
+                    # ===== Text fallbacks if the model says it's transferring / ending =====
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
-                        if any(k in txt for k in TRANSFER_HINTS):
+                        if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now", "patch you through"]):
                             log.info("Text fallback: transfer hint in delta.")
                             do_transfer()
-                        elif any(k in txt for k in HANGUP_HINTS):
+                        elif any(k in txt for k in ["ending the call now", "hanging up now", "end the call"]):
                             log.info("Text fallback: hangup hint in delta.")
                             do_hangup()
 
