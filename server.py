@@ -25,16 +25,16 @@ def load_kb():
     except Exception:
         return {}
 
-KB = load_kb()
-brand = KB.get("brand", "Elevara")
-loc   = KB.get("location", "Philadelphia, PA")
-vals  = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • instant answers • books & transfers calls"
-trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
+KB   = load_kb()
+brand= KB.get("brand", "Elevara")
+loc  = KB.get("location", "Philadelphia, PA")
+vals = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • instant answers • books & transfers calls"
+trial= KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist. You represent the product {brand}, not a person. "
     f"The company is based in {loc}. "
-    "Start in ENGLISH; switch to SPANISH only if the caller clearly uses Spanish or asks. "
+    "Default to ENGLISH; switch to SPANISH only if the caller clearly uses Spanish or asks. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
@@ -42,20 +42,21 @@ INSTRUCTIONS = (
     "TOOLS:\n"
     " - transfer_call(to, reason?) → Bridge the caller to a human immediately.\n"
     " - end_call(reason?) → Politely end the call.\n"
-    "INTENT MAP (use the tools; don't just say you'll do it):\n"
-    " - Transfer if caller says transfer/connect me/speak to a human/the manager/the person in charge/owner/Jeriel/representative/operator/live agent.\n"
-    " - End the call if caller says that's all/I'm done/no thanks/not interested/call me later/goodbye/bye/thanks bye/hang up/end the call.\n"
-    "CONFIRMATION:\n"
-    " - For transfer: “Absolutely—one moment while I connect you to the person in charge,” then call transfer_call and stop speaking.\n"
-    " - For end: “Thanks for calling—ending the call now,” then call end_call and stop speaking.\n"
-    "After you call a tool, do not continue speaking."
+    "INTENT (use the tools; don't just say you'll do it):\n"
+    " - If the caller indicates they want a human (e.g., connect me / speak to a person / manager / person in charge / owner / Jeriel / live agent), call transfer_call.\n"
+    " - If the caller indicates they are done (e.g., that's all / bye / end the call / not interested), call end_call.\n"
+    "CONFIRMATION RULES:\n"
+    " - For transfer: brief one-liner like “Absolutely—one moment while I connect you to the person in charge,” then call transfer_call and stop speaking.\n"
+    " - For end: brief closing like “Thanks for calling—ending the call now,” then call end_call and stop speaking.\n"
+    "After calling a tool, do not continue speaking."
 )
 
 def transfer_twiml(to_number: str, caller_id: str | None) -> str:
+    """Create TwiML that bridges the current call to `to_number`."""
     vr = VoiceResponse()
     vr.say("Connecting you now.")
     d = Dial(answer_on_bridge=True)
-    d.number(to_number)  # use Twilio number as caller ID by default
+    d.number(to_number)  # use your Twilio number as caller ID by default
     vr.append(d)
     return str(vr)
 
@@ -69,6 +70,7 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
+    # small TTS so Twilio hears immediate audio and keeps the stream open
     vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
@@ -108,6 +110,7 @@ async def media(ws: WebSocket):
         log.info("Connected to OpenAI Realtime")
     except Exception as e:
         log.error(f"OpenAI connect failed: {e}")
+        # fallback: if AI can't join, immediately transfer
         if tw_client and call_sid:
             try: tw_client.calls(call_sid).update(twiml=transfer_twiml(TRANSFER_NUMBER, twilio_number))
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
@@ -121,7 +124,7 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # ---------- Realtime Session Setup ----------
+    # ---------- Realtime Session Setup (NO manual commits; let server VAD auto-reply) ----------
     tools = [
         {
             "type": "function",
@@ -156,21 +159,19 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 1000,
-                    # ensure server auto-creates responses after VAD commits
-                    "create_response": True,
+                    "create_response": True,    # OpenAI will auto-start replies after user pauses
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
                 "modalities": ["audio", "text"],
-                # optional: stream user transcripts to help with debugging/fallback
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
                 "instructions": INSTRUCTIONS,
                 "tools": tools
             }
         })
-        # Kick off an English greeting and allow tool calling
+        # Initial greeting (tool_choice 'auto' enables tool use right away)
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -187,10 +188,8 @@ async def media(ws: WebSocket):
         await cleanup(); return
 
     # ---------- State ----------
-    response_active = True
-    english_lock_turns = 2
-    # Track tool items (newer event names)
-    tool_items: dict[str, dict] = {}  # {item_id: {"name": str, "args": str}}
+    # we don't manually trigger responses after each VAD commit (create_response=True already does it)
+    tool_items: dict[str, dict] = {}  # accumulate tool args across deltas
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
@@ -208,7 +207,6 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, english_lock_turns
         try:
             while True:
                 msg = await oai.receive()
@@ -216,50 +214,30 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
-                    # --- Lifecycle ---
-                    if t == "response.created":
-                        response_active = True
-                    elif t in ("response.completed", "response.failed", "response.canceled"):
-                        response_active = False
-
-                    # --- Assistant audio out ---
-                    elif t == "response.audio.delta" and stream_sid:
+                    # assistant audio -> Twilio
+                    if t == "response.audio.delta" and stream_sid:
                         await ws.send_text(json.dumps({
                             "event": "media",
                             "streamSid": stream_sid,
                             "media": {"payload": evt["delta"]}
                         }))
 
-                    # --- Barge-in ---
+                    # barge-in: clear any queued TTS
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # --- Server committed a user turn -> request reply (EN lock for first turns) ---
-                    elif t == "input_audio_buffer.committed":
-                        if not response_active:
-                            response_active = True
-                            req = {"type": "response.create",
-                                   "response": {"modalities": ["audio", "text"], "tool_choice": "auto"}}
-                            if english_lock_turns > 0:
-                                english_lock_turns -= 1
-                                req["response"]["instructions"] = "Respond in ENGLISH."
-                            await oai.send_json(req)
-
-                    # ---------- TOOL CALLS (current event family) ----------
-                    # A new output item (e.g., a tool call) was added to the response
+                    # -------- TOOL CALLS (current Realtime events) --------
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") in ("tool_call", "function_call"):
                             tool_items[item["id"]] = {"name": item.get("name"), "args": ""}
 
-                    # Streaming tool args
                     elif t == "response.output_item.delta":
                         item = evt.get("item", {})
                         iid = item.get("id")
                         if iid in tool_items and "arguments" in item:
                             tool_items[iid]["args"] += item["arguments"]
 
-                    # Tool item is complete -> execute it
                     elif t == "response.output_item.completed":
                         item = evt.get("item", {})
                         iid = item.get("id")
@@ -290,10 +268,10 @@ async def media(ws: WebSocket):
                                     except Exception as e:
                                         log.error(f"End call failed (tool): {e}")
 
-                    # --- Optional: tiny fallback if model says the words but doesn't call a tool ---
+                    # -------- Optional: tiny text fallback if tool didn't fire --------
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
-                        if any(k in txt for k in ["transfer you", "connecting you", "let me connect"]):
+                        if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you"]):
                             log.info("Fallback transfer hint from text delta.")
                             if tw_client and call_sid:
                                 try:
