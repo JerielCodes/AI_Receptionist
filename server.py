@@ -29,21 +29,22 @@ KB = load_kb()
 brand = KB.get("brand", "Elevara")
 owner = KB.get("owner_name", "Jeriel")
 loc   = KB.get("location", "Philadelphia, PA")
-langs = ", ".join(KB.get("languages", ["English","Spanish"]))
 vals  = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • instant answers • books & transfers calls"
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist for {owner} in {loc}. "
-    f"Speak {langs}. Tone: warm, professional, friendly, emotion-aware. "
-    "Keep replies to 1–2 short sentences unless asked; mirror caller language (EN/ES). "
+    "Default to ENGLISH; switch to SPANISH only if the caller speaks Spanish or asks. "
+    "Never start in any other language. "
+    "Tone: warm, professional, friendly, emotion-aware. "
+    "Keep replies to 1–2 short sentences unless asked; mirror the caller’s language (EN/ES). "
     "Use light humor only if the caller jokes about AI. "
     f"Value props: {vals}. Offer a brief demo explanation; then ask how you can help. "
     f"Offer the trial when interest is shown: {trial}. "
     "NEVER invent business facts. If unsure, say so and offer to connect the caller.\n"
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. "
     "(3) Transfer to a human on request.\n"
-    "TRANSFER PROTOCOL: If caller clearly asks to speak to a person/the person in charge/Jeriel, "
+    "TRANSFER PROTOCOL: If caller clearly asks to speak to a person / the person in charge / Jeriel, "
     "first say one line like “Absolutely—one moment while I connect you to the person in charge.” "
     "Then in the TEXT stream only output exactly <<TRANSFER>> (no other text). Do NOT say <<TRANSFER>> aloud."
 )
@@ -54,9 +55,7 @@ def transfer_twiml(to_number: str, caller_id: str) -> str:
     dial_kwargs = {"answer_on_bridge": True}
     if caller_id and caller_id.startswith("+"):
         dial_kwargs["caller_id"] = caller_id
-    d = Dial(**dial_kwargs)
-    d.number(to_number)
-    vr.append(d)
+    d = Dial(**dial_kwargs); d.number(to_number); vr.append(d)
     return str(vr)
 
 # ---------- HEALTH ----------
@@ -121,7 +120,7 @@ async def media(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-    # OpenAI session config + greeting
+    # OpenAI session config + greeting (EN by default)
     try:
         await oai.send_json({
             "type": "session.update",
@@ -138,7 +137,7 @@ async def media(ws: WebSocket):
             "type": "response.create",
             "response": {
                 "modalities": ["audio", "text"],
-                "instructions": "Greet briefly and ask how you can help."
+                "instructions": "Start in English. Greet briefly and ask how you can help."
             }
         })
     except Exception as e:
@@ -148,20 +147,21 @@ async def media(ws: WebSocket):
             except Exception as ee: log.error(f"Transfer fallback failed: {ee}")
         await cleanup(); return
 
-    # ---- State flags to prevent your errors ----
-    buffer_has_audio = False     # becomes True once we receive Twilio media
-    response_active  = True      # we just created the greeting response
+    # ---- State to avoid empty commits & double responses ----
+    chunk_count = 0            # number of audio chunks since last commit
+    MIN_CHUNKS_FOR_COMMIT = 5  # ~100ms at 20ms per chunk
+    response_active = True     # greeting already created
 
     # ---- Pumps ----
     async def twilio_to_openai():
-        nonlocal buffer_has_audio
+        nonlocal chunk_count
         try:
             while True:
                 msg = await ws.receive_text()
                 data = json.loads(msg)
                 ev = data.get("event")
                 if ev == "media":
-                    buffer_has_audio = True
+                    chunk_count += 1
                     await oai.send_json({
                         "type": "input_audio_buffer.append",
                         "audio": data["media"]["payload"]  # base64 μ-law 8k
@@ -172,7 +172,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal response_active, buffer_has_audio
+        nonlocal response_active, chunk_count
         try:
             while True:
                 msg = await oai.receive()
@@ -180,13 +180,11 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
-                    # Track response lifecycle
                     if t == "response.created":
                         response_active = True
 
                     elif t in ("response.completed", "response.failed", "response.canceled"):
                         response_active = False
-                        # check transfer intent on completed
                         if t == "response.completed":
                             out = evt.get("response", {}).get("output_text", [])
                             joined = " ".join(x or "" for x in out)
@@ -198,7 +196,6 @@ async def media(ws: WebSocket):
                                 except Exception as e:
                                     log.error(f"Live transfer failed (completed): {e}")
 
-                    # Audio back to Twilio
                     elif t == "response.audio.delta" and stream_sid:
                         await ws.send_text(json.dumps({
                             "event": "media",
@@ -206,17 +203,19 @@ async def media(ws: WebSocket):
                             "media": {"payload": evt["delta"]}
                         }))
 
-                    # Barge-in (clear Twilio buffer)
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
+                        # barge-in: clear any queued TTS
                         await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # When VAD thinks the caller stopped, commit only if we *actually* had audio
                     elif t == "input_audio_buffer.speech_stopped":
-                        if buffer_has_audio:
+                        # Only commit if we actually buffered ~100ms+ of audio
+                        if chunk_count >= MIN_CHUNKS_FOR_COMMIT:
                             await oai.send_json({"type": "input_audio_buffer.commit"})
-                            buffer_has_audio = False
+                            chunk_count = 0
+                        else:
+                            # ignore tiny/no audio to avoid commit_empty
+                            chunk_count = 0
 
-                    # After commit, request a reply ONLY if one isn't already active
                     elif t == "input_audio_buffer.committed":
                         if not response_active:
                             response_active = True
@@ -225,7 +224,6 @@ async def media(ws: WebSocket):
                                 "response": {"modalities": ["audio", "text"]}
                             })
 
-                    # Mid-stream transfer trigger (text delta)
                     elif t == "response.output_text.delta":
                         if "<<TRANSFER>>" in (evt.get("delta") or "") and call_sid and tw_client:
                             try:
