@@ -37,8 +37,9 @@ vals  = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • ins
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
-    f"You are the {brand} AI receptionist. You represent the product {brand} (based in {loc}). "
-    "Default to ENGLISH; switch to SPANISH only if the caller clearly speaks Spanish or asks. "
+    f"You are the {brand} AI receptionist (company based in {loc}). "
+    "Default to ENGLISH. Only switch languages after the caller speaks a full sentence in that language "
+    "(or explicitly asks). If they code-switch briefly, keep replying in English. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
@@ -50,10 +51,11 @@ INSTRUCTIONS = (
     "TRANSFER INTENT examples: connect me, human, person, agent, manager, person in charge, owner, Jeriel, live agent."
 )
 
+# ---------- TwiML builders (SILENT) ----------
 def transfer_twiml(to_number: str) -> str:
+    # No <Say>; answer_on_bridge keeps the caller from hearing the callee's early prompts.
     vr = VoiceResponse()
-    vr.say("Connecting you now.")
-    d = Dial(answer_on_bridge=True)
+    d = Dial(answer_on_bridge=True)  # quiet while dialing (you may still hear carrier ringback)
     d.number(to_number)
     vr.append(d)
     return str(vr)
@@ -69,12 +71,12 @@ def health():
         "transfer_number": TRANSFER_NUMBER if valid_e164(TRANSFER_NUMBER) else None,
     }
 
-# ---------- TWILIO VOICE WEBHOOK ----------
+# ---------- TWILIO VOICE WEBHOOK (SILENT) ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
-    vr.say(f"Thanks for calling {brand}. One moment while I connect you.")
+    # No <Say> here. Stream immediately to the AI; the AI owns the greeting.
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
     return PlainTextResponse(str(vr), media_type="application/xml")
@@ -170,7 +172,7 @@ async def media(ws: WebSocket):
                 "tools": tools
             }
         })
-        # Initial greeting
+        # Initial greeting (AI speaks first; Twilio said nothing)
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -187,9 +189,7 @@ async def media(ws: WebSocket):
         await cleanup(); return
 
     # ---------- State ----------
-    # Mapping for BOTH event families:
-    #   A) response.output_item.added -> item: {type:"function_call", call_id, name}
-    #   B) response.function_call_arguments.delta/done -> {call_id, arguments}
+    # We support both Realtime function-call event styles
     call_map: dict[str, dict] = {}   # call_id -> {"name": str, "args": str}
     user_buf: list[str] = []         # accumulate user transcript per turn
 
@@ -211,7 +211,7 @@ async def media(ws: WebSocket):
         with suppress(Exception):
             tw_client.calls(call_sid).update(status="completed")
 
-    # Server-side fallback NLU for user utterances (EN + ES)
+    # Simple server-side intent backup (EN + ES)
     TRANSFER_PAT = re.compile(
         r"(transfer|connect|patch|talk\s+to|speak\s+to|human|agent|representative|manager|owner|person\s+in\s+charge|someone|live\s+agent|operator|jeriel|person)\b"
         r"|(\btransferir\b|\bconectar\b|\bagente\b|\bhumano\b|\bpersona\b|\bencargad[oa]\b|\bdueñ[oa]\b|\boperador[ae]?\b)",
@@ -233,8 +233,6 @@ async def media(ws: WebSocket):
                 if ev == "media":
                     payload = (data.get("media", {}).get("payload") or "")
                     await oai.send_json({"type": "input_audio_buffer.append", "audio": payload})
-                elif ev == "mark":
-                    pass
                 elif ev == "stop":
                     reason = (data.get("stop") or {}).get("reason")
                     log.info(f"Twilio sent stop. reason={reason!r}")
@@ -253,7 +251,7 @@ async def media(ws: WebSocket):
                     t = evt.get("type")
                     log.info(f"OAI EVT: {t}")
 
-                    # ===== Debug transcripts =====
+                    # Debug transcripts
                     if t == "conversation.item.input_audio_transcription.delta":
                         delta = evt.get("delta") or ""
                         user_buf.append(delta)
@@ -277,7 +275,7 @@ async def media(ws: WebSocket):
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # ===== User utterance completed → server-side fallback intent =====
+                    # user utterance completed → backup intent
                     elif t == "conversation.item.input_audio_transcription.completed":
                         text = "".join(user_buf).strip()
                         user_buf.clear()
@@ -290,18 +288,17 @@ async def media(ws: WebSocket):
                                 log.info(f"SERVER-INTENT: hangup (from user text): {text!r}")
                                 do_hangup(reason="user_requested_hangup")
 
-                    # ===== PATH A: output_item.* announces the function + call_id =====
+                    # PATH A: function call announced
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") == "function_call":
                             call_id = item.get("call_id")
                             name    = item.get("name")
                             if call_id:
-                                entry = call_map.setdefault(call_id, {"name": None, "args": ""})
-                                if name: entry["name"] = name
+                                call_map.setdefault(call_id, {"name": name, "args": ""})
                                 log.info(f"FUNC ANNOUNCED: call_id={call_id} name={name}")
 
-                    # ===== PATH B: function_call_arguments.* streams the args by call_id =====
+                    # PATH B: function args stream in
                     elif t == "response.function_call_arguments.delta":
                         cid   = evt.get("call_id")
                         delta = evt.get("arguments", "")
@@ -325,19 +322,8 @@ async def media(ws: WebSocket):
                                 do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
                             elif name == "end_call":
                                 do_hangup(reason=args.get("reason"))
-                            else:
-                                # If name was missing, apply heuristic from recent assistant text
-                                last_hint = (evt.get("response", {}) or {}).get("output_text", [])
-                                if last_hint:
-                                    joined = " ".join(last_hint).lower()
-                                    if "transfer" in joined or "connect" in joined:
-                                        log.info("Heuristic: missing name but text suggests transfer.")
-                                        do_transfer()
-                                    elif "end the call" in joined or "hang up" in joined:
-                                        log.info("Heuristic: missing name but text suggests hangup.")
-                                        do_hangup()
 
-                    # ===== Text fallbacks if the model says it's transferring / ending =====
+                    # text fallbacks just in case
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
                         if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now", "patch you through"]):
