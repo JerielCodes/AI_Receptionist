@@ -47,15 +47,17 @@ INSTRUCTIONS = (
     "TOOLS:\n"
     " - transfer_call(to?, reason?) → Bridge to a human now (omit 'to' to use the default).\n"
     " - end_call(reason?) → Politely end the call.\n"
-    "IMPORTANT: Actually CALL tools; don’t merely mention them. After calling a tool, stop speaking.\n"
+    "IMPORTANT:\n"
+    " - When transferring, first say one short line like: “Absolutely—one moment while I connect you.”\n"
+    " - When ending, first say one short line like: “Thanks for calling—ending the call now.”\n"
+    "Then CALL the tool and stop speaking.\n"
     "TRANSFER INTENT examples: connect me, human, person, agent, manager, person in charge, owner, Jeriel, live agent."
 )
 
 # ---------- TwiML builders (SILENT) ----------
 def transfer_twiml(to_number: str) -> str:
-    # No <Say>; answer_on_bridge keeps the caller from hearing the callee's early prompts.
     vr = VoiceResponse()
-    d = Dial(answer_on_bridge=True)  # quiet while dialing (you may still hear carrier ringback)
+    d = Dial(answer_on_bridge=True)  # silent while dialing (carrier ringback may still be heard)
     d.number(to_number)
     vr.append(d)
     return str(vr)
@@ -76,7 +78,7 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
-    # No <Say> here. Stream immediately to the AI; the AI owns the greeting.
+    # No <Say>; the AI owns the greeting
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
     return PlainTextResponse(str(vr), media_type="application/xml")
@@ -172,7 +174,7 @@ async def media(ws: WebSocket):
                 "tools": tools
             }
         })
-        # Initial greeting (AI speaks first; Twilio said nothing)
+        # Initial greeting
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -189,9 +191,11 @@ async def media(ws: WebSocket):
         await cleanup(); return
 
     # ---------- State ----------
-    # We support both Realtime function-call event styles
     call_map: dict[str, dict] = {}   # call_id -> {"name": str, "args": str}
     user_buf: list[str] = []         # accumulate user transcript per turn
+
+    # Announcement queue: after the next response.done, run action
+    pending_action: dict | None = None  # {"type":"transfer"/"hangup", "to":..., "reason":...}
 
     # ---------- Twilio actions ----------
     def do_transfer(reason: str | None = None, to: str | None = None):
@@ -210,6 +214,23 @@ async def media(ws: WebSocket):
         log.info(f"HANGUP via Twilio REST. reason={reason!r}")
         with suppress(Exception):
             tw_client.calls(call_sid).update(status="completed")
+
+    async def announce_then(action: dict):
+        """Queue a short spoken confirmation, then run the action after response.done."""
+        nonlocal pending_action
+        if action.get("type") == "transfer":
+            say = "Absolutely—one moment while I connect you."
+        else:
+            say = "Thanks for calling—ending the call now."
+        pending_action = action
+        log.info(f"ANNOUNCE queued → {action}")
+        await oai.send_json({
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio", "text"],
+                "instructions": f"Say exactly: \"{say}\" Keep it under 2 seconds."
+            }
+        })
 
     # Simple server-side intent backup (EN + ES)
     TRANSFER_PAT = re.compile(
@@ -243,6 +264,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
+        nonlocal pending_action
         try:
             while True:
                 msg = await oai.receive()
@@ -275,6 +297,16 @@ async def media(ws: WebSocket):
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
+                    # When the announcement finishes, run the pending action
+                    elif t == "response.done" and pending_action:
+                        action = pending_action
+                        pending_action = None
+                        log.info(f"ANNOUNCE done → executing {action}")
+                        if action.get("type") == "transfer":
+                            do_transfer(reason=action.get("reason"), to=action.get("to"))
+                        else:
+                            do_hangup(reason=action.get("reason"))
+
                     # user utterance completed → backup intent
                     elif t == "conversation.item.input_audio_transcription.completed":
                         text = "".join(user_buf).strip()
@@ -283,10 +315,10 @@ async def media(ws: WebSocket):
                             low = text.lower()
                             if TRANSFER_PAT.search(low):
                                 log.info(f"SERVER-INTENT: transfer (from user text): {text!r}")
-                                do_transfer(reason="user_requested_transfer")
+                                await announce_then({"type":"transfer","reason":"user_requested_transfer"})
                             elif HANGUP_PAT.search(low):
                                 log.info(f"SERVER-INTENT: hangup (from user text): {text!r}")
-                                do_hangup(reason="user_requested_hangup")
+                                await announce_then({"type":"hangup","reason":"user_requested_hangup"})
 
                     # PATH A: function call announced
                     elif t == "response.output_item.added":
@@ -319,19 +351,19 @@ async def media(ws: WebSocket):
                                 args = {}
                             log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
                             if name == "transfer_call":
-                                do_transfer(reason=args.get("reason"), to=(args.get("to") or None))
+                                await announce_then({"type":"transfer","to":(args.get("to") or None),"reason":args.get("reason")})
                             elif name == "end_call":
-                                do_hangup(reason=args.get("reason"))
+                                await announce_then({"type":"hangup","reason":args.get("reason")})
 
                     # text fallbacks just in case
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
                         if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now", "patch you through"]):
                             log.info("Text fallback: transfer hint in delta.")
-                            do_transfer()
+                            await announce_then({"type":"transfer"})
                         elif any(k in txt for k in ["ending the call now", "hanging up now", "end the call"]):
                             log.info("Text fallback: hangup hint in delta.")
-                            do_hangup()
+                            await announce_then({"type":"hangup"})
 
                     elif t == "error":
                         log.error(f"OpenAI error: {evt}")
