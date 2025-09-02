@@ -1,5 +1,5 @@
 # server.py
-import os, json, asyncio, logging, aiohttp, re
+import os, json, asyncio, logging, aiohttp, re, uuid
 from contextlib import suppress
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
@@ -8,19 +8,38 @@ from twilio.rest import Client
 
 # ---------- LOGGING ----------
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("elevara")
+log = logging.getLogger("elvara")
 
 app = FastAPI()
 
 # ---------- ENV ----------
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
-TRANSFER_NUMBER = os.getenv("TRANSFER_NUMBER", "")
-TW_SID          = os.getenv("TWILIO_ACCOUNT_SID", "")
-TW_TOKEN        = os.getenv("TWILIO_AUTH_TOKEN", "")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+TRANSFER_NUMBER  = os.getenv("TRANSFER_NUMBER", "")
+TW_SID           = os.getenv("TWILIO_ACCOUNT_SID", "")
+TW_TOKEN         = os.getenv("TWILIO_AUTH_TOKEN", "")
+MAIN_WEBHOOK_URL = os.getenv("MAIN_WEBHOOK_URL", "https://elevara.app.n8n.cloud/webhook-test/appointment-webhook")  # book+reschedule
+CANCEL_WEBHOOK_URL = os.getenv("CANCEL_WEBHOOK_URL", "")  # <-- set your cancel workflow webhook here
+EVENT_TYPE_ID    = int(os.getenv("EVENT_TYPE_ID", "3117986"))
+DEFAULT_TZ       = "America/New_York"
+
 tw_client = Client(TW_SID, TW_TOKEN) if (TW_SID and TW_TOKEN) else None
 
 def valid_e164(n: str | None) -> bool:
     return bool(n and re.fullmatch(r"\+\d{7,15}", n))
+
+def to_e164(s: str | None) -> str | None:
+    """Very light US-default normalizer: +E.164 if possible."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.startswith("+"):
+        digits = re.sub(r"\D", "", s)
+        return f"+{digits}" if len(digits) >= 8 else None
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 10:
+        # US default: last 10 as local; prepend +1
+        return "+1" + digits[-10:]
+    return None
 
 # ---------- BUSINESS PROMPT ----------
 def load_kb():
@@ -31,23 +50,27 @@ def load_kb():
         return {}
 
 KB    = load_kb()
-brand = KB.get("brand", "Elevara")
+brand = KB.get("brand", "ELvara")  # >>> ELVARA: default to ELvara
 loc   = KB.get("location", "Philadelphia, PA")
 vals  = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • instant answers • books & transfers calls"
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist (company based in {loc}). "
-    "Default to ENGLISH. Only switch languages after the caller speaks a full sentence in that language "
-    "(or explicitly asks). If they code-switch briefly, keep replying in English. "
+    "Default to ENGLISH, but if the caller speaks another language fluently, switch to that language naturally. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
-    "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo. (3) Transfer to a human on request. "
+    "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo/installation. (3) Transfer to a human on request. "
     "TOOLS:\n"
+    " - appointment_webhook(book|reschedule): Schedules via our n8n main workflow.\n"
+    " - cancel_workflow(cancel): Cancels via our n8n cancel workflow.\n"
     " - transfer_call(to?, reason?) → Bridge to a human now (omit 'to' to use the default).\n"
     " - end_call(reason?) → Politely end the call.\n"
     "IMPORTANT:\n"
+    " - For booking/rescheduling: ALWAYS use tz 'America/New_York'. Collect name, email (for confirmations), phone, and time.\n"
+    " - Prefer the callerID phone number; confirm it briefly: “Is this the best number ending in ####?”\n"
+    " - For cancel: need name + (phone OR email). Prefer phone. No time required.\n"
     " - When transferring, first say one short line like: “Absolutely—one moment while I connect you.”\n"
     " - When ending, first say one short line like: “Thanks for calling—ending the call now.”\n"
     "Then CALL the tool and stop speaking.\n"
@@ -57,7 +80,7 @@ INSTRUCTIONS = (
 # ---------- TwiML builders (SILENT) ----------
 def transfer_twiml(to_number: str) -> str:
     vr = VoiceResponse()
-    d = Dial(answer_on_bridge=True)  # silent while dialing (carrier ringback may still be heard)
+    d = Dial(answer_on_bridge=True)
     d.number(to_number)
     vr.append(d)
     return str(vr)
@@ -71,6 +94,8 @@ def health():
         "twilio_ready": bool(tw_client),
         "transfer_ready": valid_e164(TRANSFER_NUMBER),
         "transfer_number": TRANSFER_NUMBER if valid_e164(TRANSFER_NUMBER) else None,
+        "main_webhook": bool(MAIN_WEBHOOK_URL),
+        "cancel_webhook": bool(CANCEL_WEBHOOK_URL),
     }
 
 # ---------- TWILIO VOICE WEBHOOK (SILENT) ----------
@@ -78,7 +103,6 @@ def health():
 async def voice(request: Request):
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME") or request.url.hostname
     vr = VoiceResponse()
-    # No <Say>; the AI owns the greeting
     vr.connect().stream(url=f"wss://{host}/media")
     log.info(f"Returning TwiML with stream URL: wss://{host}/media")
     return PlainTextResponse(str(vr), media_type="application/xml")
@@ -92,16 +116,17 @@ async def media(ws: WebSocket):
     await ws.accept()
 
     # Wait for Twilio 'start'
-    stream_sid = call_sid = twilio_number = None
+    stream_sid = call_sid = caller_number = None
     try:
         while True:
             first = await asyncio.wait_for(ws.receive_text(), timeout=10)
             data0 = json.loads(first)
             if data0.get("event") == "start":
-                stream_sid = data0["start"]["streamSid"]
-                call_sid   = data0["start"].get("callSid", "")
-                twilio_number = data0["start"].get("to")
-                log.info(f"Twilio stream started: streamSid={stream_sid}, callSid={call_sid}")
+                stream_sid   = data0["start"]["streamSid"]
+                call_sid     = data0["start"].get("callSid", "")
+                caller_raw   = data0["start"].get("from") or ""  # >>> ELVARA: use 'from' (caller)
+                caller_number = to_e164(caller_raw)
+                log.info(f"Twilio stream started: streamSid={stream_sid}, callSid={call_sid}, caller={caller_number!r}")
                 break
     except Exception as e:
         log.error(f"Twilio start wait failed: {e}")
@@ -133,6 +158,37 @@ async def media(ws: WebSocket):
     tools = [
         {
             "type": "function",
+            "name": "appointment_webhook",
+            "description": "Book or reschedule via main n8n workflow.",
+            "parameters": {
+                "type": "object",
+                "required": ["booking_type", "name", "email", "phone", "startTime"],
+                "properties": {
+                    "booking_type": {"type": "string", "enum": ["book", "reschedule"]},
+                    "name": {"type": "string"},
+                    "email": {"type": "string"},
+                    "phone": {"type": "string", "description": "E.164 like +15551234567"},
+                    "startTime": {"type": "string", "description": "ISO 8601 with offset, e.g., 2025-09-26T11:30:00-04:00"},
+                    "event_type_id": {"type": "integer", "default": EVENT_TYPE_ID}
+                }
+            }
+        },
+        {
+            "type": "function",
+            "name": "cancel_workflow",
+            "description": "Cancel booking using name + (phone OR email). Prefer phone.",
+            "parameters": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "phone": {"type": "string", "nullable": True},
+                    "email": {"type": "string", "nullable": True}
+                }
+            }
+        },
+        {
+            "type": "function",
             "name": "transfer_call",
             "description": "Bridge the caller to a human immediately. If 'to' is omitted, use the default business line.",
             "parameters": {
@@ -156,6 +212,13 @@ async def media(ws: WebSocket):
 
     # ---------- Session setup ----------
     try:
+        # Bake caller phone and tz rules into runtime instructions
+        dyn_instructions = (
+            INSTRUCTIONS +
+            f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
+            f"- ALWAYS use timezone: {DEFAULT_TZ}\n"
+            "- If phone is missing from the user, propose using caller_id_e164 and confirm last 4 digits.\n"
+        )
         await oai.send_json({
             "type": "session.update",
             "session": {
@@ -170,7 +233,7 @@ async def media(ws: WebSocket):
                 "voice": "alloy",
                 "modalities": ["audio", "text"],
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
-                "instructions": INSTRUCTIONS,
+                "instructions": dyn_instructions,
                 "tools": tools
             }
         })
@@ -180,7 +243,7 @@ async def media(ws: WebSocket):
             "response": {
                 "modalities": ["audio", "text"],
                 "tool_choice": "auto",
-                "instructions": "Start in ENGLISH. Greet briefly and ask how you can help."
+                "instructions": "Start in English. Greet briefly and ask how you can help."
             }
         })
     except Exception as e:
@@ -191,11 +254,9 @@ async def media(ws: WebSocket):
         await cleanup(); return
 
     # ---------- State ----------
-    call_map: dict[str, dict] = {}   # call_id -> {"name": str, "args": str}
-    user_buf: list[str] = []         # accumulate user transcript per turn
-
-    # Announcement queue: after the next response.done, run action
-    pending_action: dict | None = None  # {"type":"transfer"/"hangup", "to":..., "reason":...}
+    call_map: dict[str, dict] = {}
+    user_buf: list[str] = []
+    pending_action: dict | None = None
 
     # ---------- Twilio actions ----------
     def do_transfer(reason: str | None = None, to: str | None = None):
@@ -218,10 +279,7 @@ async def media(ws: WebSocket):
     async def announce_then(action: dict):
         """Queue a short spoken confirmation, then run the action after response.done."""
         nonlocal pending_action
-        if action.get("type") == "transfer":
-            say = "Absolutely—one moment while I connect you."
-        else:
-            say = "Thanks for calling—ending the call now."
+        say = "Absolutely—one moment while I connect you." if action.get("type") == "transfer" else "Thanks for calling—ending the call now."
         pending_action = action
         log.info(f"ANNOUNCE queued → {action}")
         await oai.send_json({
@@ -232,7 +290,7 @@ async def media(ws: WebSocket):
             }
         })
 
-    # Simple server-side intent backup (EN + ES)
+    # Simple server intent backup (EN + ES)
     TRANSFER_PAT = re.compile(
         r"(transfer|connect|patch|talk\s+to|speak\s+to|human|agent|representative|manager|owner|person\s+in\s+charge|someone|live\s+agent|operator|jeriel|person)\b"
         r"|(\btransferir\b|\bconectar\b|\bagente\b|\bhumano\b|\bpersona\b|\bencargad[oa]\b|\bdueñ[oa]\b|\boperador[ae]?\b)",
@@ -243,6 +301,22 @@ async def media(ws: WebSocket):
         r"|(\bcolgar\b|\bterminar\b.*\bllamad[ao]?\b|\bad(i|í)os\b|\bno\s+interesad[oa]\b)",
         re.IGNORECASE
     )
+
+    # ---------- Helper: JSON POST ----------
+    async def json_post(url: str, payload: dict) -> tuple[int, dict | str]:
+        try:
+            async with session.post(url, json=payload, timeout=20) as resp:
+                ct = resp.headers.get("content-type", "")
+                status = resp.status
+                if "application/json" in ct:
+                    data = await resp.json()
+                else:
+                    data = await resp.text()
+                log.info(f"POST {url} -> {status} {str(data)[:300]}")
+                return status, data
+        except Exception as e:
+            log.error(f"POST {url} failed: {e}")
+            return 0, str(e)
 
     # ---------- Pumps ----------
     async def twilio_to_openai():
@@ -350,8 +424,105 @@ async def media(ws: WebSocket):
                                 log.error(f"Bad JSON for function args: {raw!r}")
                                 args = {}
                             log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
-                            if name == "transfer_call":
+
+                            # >>> ELVARA: Handle our new tools
+                            if name == "appointment_webhook":
+                                # fill in defaults + safety
+                                payload = {
+                                    "tool": "book",
+                                    "booking_type": args.get("booking_type", "book"),
+                                    "name": args.get("name", "").strip(),
+                                    "email": args.get("email", "").strip(),
+                                    "phone": args.get("phone") or caller_number or "",
+                                    "tz": DEFAULT_TZ,
+                                    "startTime": args.get("startTime", "").strip(),
+                                    "event_type_id": int(args.get("event_type_id", EVENT_TYPE_ID)),
+                                    "idempotency_key": f"ai-{uuid.uuid4().hex}"
+                                }
+                                # POST to main webhook
+                                status, data = await json_post(MAIN_WEBHOOK_URL, payload)
+                                if status == 200:
+                                    # success → short confirmation
+                                    await oai.send_json({
+                                        "type": "response.create",
+                                        "response": {
+                                            "modalities": ["audio","text"],
+                                            "instructions": (
+                                                "All set. I’ve scheduled that in Eastern Time and sent confirmation emails with calendar invites. "
+                                                "Anything else I can help you with?"
+                                            )
+                                        }
+                                    })
+                                elif status in (409, 422):  # slot conflict or invalid
+                                    await oai.send_json({
+                                        "type": "response.create",
+                                        "response": {
+                                            "modalities": ["audio","text"],
+                                            "instructions": (
+                                                "Looks like that time isn’t available. Would you like an earlier or later time the same day, "
+                                                "or a nearby day around that time?"
+                                            )
+                                        }
+                                    })
+                                else:
+                                    await oai.send_json({
+                                        "type": "response.create",
+                                        "response": {
+                                            "modalities": ["audio","text"],
+                                            "instructions": (
+                                                "I couldn’t finalize that just now. Would you like me to try again, or pick a different time?"
+                                            )
+                                        }
+                                    })
+
+                            elif name == "cancel_workflow":
+                                # Require at least name + (phone or email)
+                                payload = {
+                                    "action": "cancel",
+                                    "name": (args.get("name") or "").strip(),
+                                    "phone": args.get("phone") or caller_number or None,
+                                    "email": (args.get("email") or None)
+                                }
+                                if not CANCEL_WEBHOOK_URL:
+                                    log.error("CANCEL_WEBHOOK_URL not set; cannot cancel.")
+                                    await oai.send_json({
+                                        "type": "response.create",
+                                        "response": {
+                                            "modalities": ["audio","text"],
+                                            "instructions": (
+                                                "I can cancel that, but my cancel line isn’t connected yet. "
+                                                "Could I connect you to the person in charge, or would you like me to take a message?"
+                                            )
+                                        }
+                                    })
+                                else:
+                                    status, data = await json_post(CANCEL_WEBHOOK_URL, payload)
+                                    if status == 200:
+                                        await oai.send_json({
+                                            "type": "response.create",
+                                            "response": {
+                                                "modalities": ["audio","text"],
+                                                "instructions": (
+                                                    "Done. I’ve canceled your appointment and sent confirmation emails. "
+                                                    "Is there anything else I can help you with?"
+                                                )
+                                            }
+                                        })
+                                    else:
+                                        await oai.send_json({
+                                            "type": "response.create",
+                                            "response": {
+                                                "modalities": ["audio","text"],
+                                                "instructions": (
+                                                    "I couldn’t find an active booking for that name and number. "
+                                                    "Do you use another email or phone I can try?"
+                                                )
+                                            }
+                                        })
+
+                            elif name == "transfer_call":
                                 await announce_then({"type":"transfer","to":(args.get("to") or None),"reason":args.get("reason")})
+
                             elif name == "end_call":
                                 await announce_then({"type":"hangup","reason":args.get("reason")})
 
