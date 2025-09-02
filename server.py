@@ -50,7 +50,7 @@ def load_kb():
         return {}
 
 KB    = load_kb()
-brand = KB.get("brand", "ELvara")  # >>> ELVARA: default to ELvara
+brand = KB.get("brand", "ELvara")
 loc   = KB.get("location", "Philadelphia, PA")
 vals  = " • ".join(KB.get("value_props", [])) or "24/7 AI receptionist • instant answers • books & transfers calls"
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
@@ -75,6 +75,20 @@ INSTRUCTIONS = (
     " - When ending, first say one short line like: “Thanks for calling—ending the call now.”\n"
     "Then CALL the tool and stop speaking.\n"
     "TRANSFER INTENT examples: connect me, human, person, agent, manager, person in charge, owner, Jeriel, live agent."
+)
+
+# ---- Discovery-first, flexible behavior (additive) ----
+INSTRUCTIONS += (
+    "\n\nDISCOVERY-FIRST, FLEXIBLE SCRIPTING:\n"
+    "• When asked “What do you do?” or “How can this help?”, FIRST give a natural 1-sentence answer like: "
+    "  “We provide business solutions that save you time and money and help you grow—things like CRM/workflow automations, websites/SEO, and custom apps.” "
+    "  THEN immediately ask: “What kind of business do you run so I can tailor examples?”\n"
+    "• Be flexible—paraphrase naturally and do NOT stick to any script word-for-word.\n"
+    "• After they share the business, give 1–2 simple, outcome-focused examples for that vertical (no rigid template), then ask one focused follow-up: "
+    "  “What’s the top thing you want to improve—missed calls, no-shows, follow-ups, scheduling, payments, or job tracking?”\n"
+    "• Pricing & timelines: avoid exact numbers or durations. Explain both depend on needs and integrations; offer a one-week free trial and a tailored quote. "
+    "  Setup time depends on the services (simple receptionist is quick; deeper POS/CRM or custom apps take longer).\n"
+    "• Always offer a next step: (a) live transfer to the person in charge, or (b) book a demo/installation in Eastern Time."
 )
 
 # ---------- TwiML builders (SILENT) ----------
@@ -124,7 +138,7 @@ async def media(ws: WebSocket):
             if data0.get("event") == "start":
                 stream_sid   = data0["start"]["streamSid"]
                 call_sid     = data0["start"].get("callSid", "")
-                caller_raw   = data0["start"].get("from") or ""  # >>> ELVARA: use 'from' (caller)
+                caller_raw   = data0["start"].get("from") or ""
                 caller_number = to_e164(caller_raw)
                 log.info(f"Twilio stream started: streamSid={stream_sid}, callSid={call_sid}, caller={caller_number!r}")
                 break
@@ -425,9 +439,8 @@ async def media(ws: WebSocket):
                                 args = {}
                             log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
 
-                            # >>> ELVARA: Handle our new tools
+                            # Handle our tools
                             if name == "appointment_webhook":
-                                # fill in defaults + safety
                                 payload = {
                                     "tool": "book",
                                     "booking_type": args.get("booking_type", "book"),
@@ -439,10 +452,8 @@ async def media(ws: WebSocket):
                                     "event_type_id": int(args.get("event_type_id", EVENT_TYPE_ID)),
                                     "idempotency_key": f"ai-{uuid.uuid4().hex}"
                                 }
-                                # POST to main webhook
                                 status, data = await json_post(MAIN_WEBHOOK_URL, payload)
                                 if status == 200:
-                                    # success → short confirmation
                                     await oai.send_json({
                                         "type": "response.create",
                                         "response": {
@@ -453,7 +464,7 @@ async def media(ws: WebSocket):
                                             )
                                         }
                                     })
-                                elif status in (409, 422):  # slot conflict or invalid
+                                elif status in (409, 422):
                                     await oai.send_json({
                                         "type": "response.create",
                                         "response": {
@@ -476,7 +487,6 @@ async def media(ws: WebSocket):
                                     })
 
                             elif name == "cancel_workflow":
-                                # Require at least name + (phone or email)
                                 payload = {
                                     "action": "cancel",
                                     "name": (args.get("name") or "").strip(),
@@ -569,6 +579,7 @@ async def media(ws: WebSocket):
     done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
     for p in pending:
         p.cancel()
+    for p in pending:
         with suppress(Exception, asyncio.CancelledError):
             await p
     await cleanup()
