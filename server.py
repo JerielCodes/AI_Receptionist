@@ -18,7 +18,7 @@ TRANSFER_NUMBER  = os.getenv("TRANSFER_NUMBER", "")
 TW_SID           = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN         = os.getenv("TWILIO_AUTH_TOKEN", "")
 MAIN_WEBHOOK_URL = os.getenv("MAIN_WEBHOOK_URL", "https://elevara.app.n8n.cloud/webhook-test/appointment-webhook")  # book+reschedule
-CANCEL_WEBHOOK_URL = os.getenv("CANCEL_WEBHOOK_URL", "")  # <-- set your cancel workflow webhook here
+CANCEL_WEBHOOK_URL = os.getenv("CANCEL_WEBHOOK_URL", "")
 EVENT_TYPE_ID    = int(os.getenv("EVENT_TYPE_ID", "3117986"))
 DEFAULT_TZ       = "America/New_York"
 
@@ -28,7 +28,6 @@ def valid_e164(n: str | None) -> bool:
     return bool(n and re.fullmatch(r"\+\d{7,15}", n))
 
 def to_e164(s: str | None) -> str | None:
-    """Very light US-default normalizer: +E.164 if possible."""
     if not s:
         return None
     s = s.strip()
@@ -37,7 +36,6 @@ def to_e164(s: str | None) -> str | None:
         return f"+{digits}" if len(digits) >= 8 else None
     digits = re.sub(r"\D", "", s)
     if len(digits) >= 10:
-        # US default: last 10 as local; prepend +1
         return "+1" + digits[-10:]
     return None
 
@@ -83,7 +81,6 @@ INSTRUCTIONS = (
     "TRANSFER INTENT examples: connect me, human, person, agent, manager, person in charge, owner, Jeriel, live agent."
 )
 
-# ---- Discovery-first, flexible + confirmation rules ----
 INSTRUCTIONS += (
     "\n\nGREETING VARIANTS:\n"
     "• On the very first response of the call, start in English and use one of these exact lines:\n"
@@ -92,6 +89,7 @@ INSTRUCTIONS += (
     "  - \"Hi, thanks for calling ELvara. How may I assist you?\"\n"
     "• Keep it to one sentence; do not add extra lines before the question.\n"
 )
+
 INSTRUCTIONS += (
     "\n\nDISCOVERY-FIRST, FLEXIBLE SCRIPTING:\n"
     "• When asked “What do you do?” or “How can this help?”, FIRST give a natural 1-sentence answer like: "
@@ -104,6 +102,7 @@ INSTRUCTIONS += (
     "  Setup time depends on chosen services (simple receptionist is quick; deeper POS/CRM or custom apps take longer).\n"
     "• Always offer a next step: (a) live transfer to the person in charge, or (b) book a demo/installation in Eastern Time."
 )
+
 INSTRUCTIONS += (
     "\n\nBOOKING EXECUTION + READBACK RULES:\n"
     "• When you have name, email, phone, and a time, CALL appointment_webhook immediately (booking_type 'book' or 'reschedule').\n"
@@ -248,13 +247,12 @@ async def media(ws: WebSocket):
 
     # ---------- Session setup ----------
     try:
-        # Bake caller phone and tz rules into runtime instructions (with real last-4)
         dyn_instructions = (
             INSTRUCTIONS +
             f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
             f"- caller_id_last4={caller_last4 or 'unknown'}\n"
-            f"- ALWAYS use timezone: {DEFAULT_TZ}\n"
-            + (
+            f"- ALWAYS use timezone: {DEFAULT_TZ}\n" +
+            (
                 f"- If phone is missing from the user, propose using caller_id_e164 and confirm explicitly: "
                 f"“Is this the best number ending in {caller_last4}?”\n" if caller_last4 else
                 "- If phone is missing from the user, ask for it directly and confirm back the digits.\n"
@@ -275,14 +273,14 @@ async def media(ws: WebSocket):
                 "modalities": ["audio", "text"],
                 "input_audio_transcription": {
                     "model": "gpt-4o-mini-transcribe",
-                    "language": "en",  # force English to start
+                    "language": "en",
                     "prompt": "Transcribe in English. Only switch if the caller speaks a full sentence in another language."
                 },
                 "instructions": dyn_instructions,
                 "tools": tools
             }
         })
-        # Initial greeting — choose one of the variants (verbatim)
+        # Initial greeting — choose one variant (verbatim)
         await oai.send_json({
             "type": "response.create",
             "response": {
@@ -327,7 +325,6 @@ async def media(ws: WebSocket):
             tw_client.calls(call_sid).update(status="completed")
 
     async def announce_then(action: dict):
-        """Queue a short spoken confirmation, then run the action after response.done."""
         nonlocal pending_action
         say = "Absolutely—one moment while I connect you." if action.get("type") == "transfer" else "Thanks for calling—ending the call now."
         pending_action = action
@@ -340,18 +337,6 @@ async def media(ws: WebSocket):
             }
         })
 
-    # Simple server intent backup (EN + ES)
-    TRANSFER_PAT = re.compile(
-        r"(transfer|connect|patch|talk\s+to|speak\s+to|human|agent|representative|manager|owner|person\s+in\s+charge|someone|live\s+agent|operator|jeriel|person)\b"
-        r"|(\btransferir\b|\bconectar\b|\bagente\b|\bhumano\b|\bpersona\b|\bencargad[oa]\b|\bdueñ[oa]\b|\boperador[ae]?\b)",
-        re.IGNORECASE
-    )
-    HANGUP_PAT = re.compile(
-        r"(hang\s*up|end\s+the\s+call|that'?s\s+all|that is all|bye|good\s*bye|not\s+interested|we'?re\s+done)"
-        r"|(\bcolgar\b|\bterminar\b.*\bllamad[ao]?\b|\bad(i|í)os\b|\bno\s+interesad[oa]\b)",
-        re.IGNORECASE
-    )
-
     # ---------- Helper: JSON POST ----------
     async def json_post(url: str, payload: dict) -> tuple[int, dict | str]:
         try:
@@ -362,7 +347,9 @@ async def media(ws: WebSocket):
                     data = await resp.json()
                 else:
                     data = await resp.text()
-                log.info(f"POST {url} -> {status} {str(data)[:300]}")
+                # compact log
+                preview = data if isinstance(data, str) else {k: data.get(k) for k in ("status","code","event_id","start_iso")}
+                log.info(f"POST {url} -> {status} {preview}")
                 return status, data
         except Exception as e:
             log.error(f"POST {url} failed: {e}")
@@ -437,10 +424,10 @@ async def media(ws: WebSocket):
                         user_buf.clear()
                         if text:
                             low = text.lower()
-                            if TRANSFER_PAT.search(low):
+                            if re.search(r"(transfer|connect|human|agent|representative|manager|owner|person\s+in\s+charge|live\s+agent|operator|jeriel)\b", low):
                                 log.info(f"SERVER-INTENT: transfer (from user text): {text!r}")
                                 await announce_then({"type":"transfer","reason":"user_requested_transfer"})
-                            elif HANGUP_PAT.search(low):
+                            elif re.search(r"(hang\s*up|end\s+the\s+call|that's\s+all|that is all|bye|good\s*bye|not\s+interested|we're\s+done|colgar|terminar.*llamada|ad(i|í)os)", low):
                                 log.info(f"SERVER-INTENT: hangup (from user text): {text!r}")
                                 await announce_then({"type":"hangup","reason":"user_requested_hangup"})
 
@@ -475,7 +462,7 @@ async def media(ws: WebSocket):
                                 args = {}
                             log.info(f"TOOL (fn_args) COMPLETE: {name} args={args}")
 
-                            # Handle our tools
+                            # ---- Book/Reschedule ----
                             if name == "appointment_webhook":
                                 payload_phone = args.get("phone") or caller_number or ""
                                 payload = {
@@ -491,8 +478,13 @@ async def media(ws: WebSocket):
                                 }
                                 status, data = await json_post(MAIN_WEBHOOK_URL, payload)
                                 phone_last4 = last4(payload_phone)
-                                if status == 200:
-                                    # success → short confirmation with readback
+
+                                # n8n often responds 200 for both success & conflict; inspect JSON body
+                                body_status = data.get("status") if isinstance(data, dict) else None
+                                is_booked = (status == 200 and body_status == "booked")
+                                is_conflict = (status in (409, 422)) or (status == 200 and body_status == "conflict_or_error")
+
+                                if is_booked:
                                     readback = (
                                         f"All set. I’ve scheduled that in Eastern Time. "
                                         f"I have your email as {payload['email']}"
@@ -500,11 +492,8 @@ async def media(ws: WebSocket):
                                         + ". You’ll receive confirmation emails with calendar invites. "
                                         "Anything else I can help you with?"
                                     )
-                                    await oai.send_json({
-                                        "type": "response.create",
-                                        "response": {"modalities": ["audio","text"], "instructions": readback}
-                                    })
-                                elif status in (409, 422):
+                                    await oai.send_json({"type": "response.create","response": {"modalities": ["audio","text"], "instructions": readback}})
+                                elif is_conflict:
                                     await oai.send_json({
                                         "type": "response.create",
                                         "response": {
@@ -526,6 +515,7 @@ async def media(ws: WebSocket):
                                         }
                                     })
 
+                            # ---- Cancel ----
                             elif name == "cancel_workflow":
                                 payload = {
                                     "action": "cancel",
@@ -548,18 +538,19 @@ async def media(ws: WebSocket):
                                 else:
                                     status, data = await json_post(CANCEL_WEBHOOK_URL, payload)
                                     phone_last4 = last4(payload.get("phone"))
-                                    if status == 200:
+                                    body_status = data.get("status") if isinstance(data, dict) else None
+                                    is_cancelled = (status == 200 and body_status in {"cancelled","ok","success"})
+                                    not_found = (status == 404) or (status == 200 and body_status in {"not_found","conflict_or_error"})
+
+                                    if is_cancelled:
                                         readback = (
                                             "Done. I’ve canceled your appointment"
                                             + (f" for the number ending in {phone_last4}" if phone_last4 else "")
                                             + (f" and email {payload.get('email')}" if payload.get("email") else "")
                                             + ". Is there anything else I can help you with?"
                                         )
-                                        await oai.send_json({
-                                            "type": "response.create",
-                                            "response": {"modalities": ["audio","text"], "instructions": readback}
-                                        })
-                                    else:
+                                        await oai.send_json({"type": "response.create","response": {"modalities": ["audio","text"], "instructions": readback}})
+                                    elif not_found:
                                         await oai.send_json({
                                             "type": "response.create",
                                             "response": {
@@ -567,6 +558,16 @@ async def media(ws: WebSocket):
                                                 "instructions": (
                                                     "I couldn’t find an active booking for that name and number. "
                                                     "Do you use another email or phone I can try?"
+                                                )
+                                            }
+                                        })
+                                    else:
+                                        await oai.send_json({
+                                            "type": "response.create",
+                                            "response": {
+                                                "modalities": ["audio","text"],
+                                                "instructions": (
+                                                    "I ran into a problem canceling that. Want me to try again or connect you to the person in charge?"
                                                 )
                                             }
                                         })
@@ -603,11 +604,7 @@ async def media(ws: WebSocket):
                 await asyncio.sleep(15)
                 if stream_sid:
                     with suppress(Exception):
-                        await ws.send_text(json.dumps({
-                            "event": "mark",
-                            "streamSid": stream_sid,
-                            "mark": {"name": "hb"}
-                        }))
+                        await ws.send_text(json.dumps({"event": "mark","streamSid": stream_sid,"mark": {"name": "hb"}}))
         except asyncio.CancelledError:
             pass
         except Exception:
