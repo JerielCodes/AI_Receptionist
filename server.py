@@ -61,8 +61,8 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist (company based in {loc}). "
-    "Start in ENGLISH. Only switch languages after the caller speaks a full sentence in that language or explicitly asks. "
-    "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
+    "Start in ENGLISH. Match the caller’s language after they speak a full sentence in that language "
+    "or explicitly ask to switch. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
     "GOALS: (1) Explain benefits & answer questions. (2) Offer to book a demo/installation. (3) Transfer to a human on request. "
@@ -110,6 +110,37 @@ INSTRUCTIONS += (
     "• Do NOT say goodbye or end the call until the tool returns success or an error.\n"
     "• On conflict/error: briefly apologize and ask for an earlier/later time or nearby day."
 )
+
+# ---------- Language detection helpers ----------
+ES_HINTS = {
+    "hola","buenos","buenas","gracias","por","favor","claro","sí","si","conectarme","transferir",
+    "agendar","programar","reprogramar","cancelar","cita","llamar","persona","encargado","dueño",
+    "puedes","necesito","quiero","ayuda","podrías","disponible","hora","mañana","tarde","hoy"
+}
+EN_HINTS = {
+    "hello","hi","thanks","thank","please","sure","yes","yeah","book","schedule","reschedule",
+    "cancel","appointment","call","person","manager","owner","need","want","help","available",
+    "time","tomorrow","afternoon","today"
+}
+ASK_ES_PAT = re.compile(r"\b(en\s+español|habla\s+español|puedes\s+hablar\s+español)\b", re.IGNORECASE)
+ASK_EN_PAT = re.compile(r"\b(in\s+english|speak\s+english|english\s+please)\b", re.IGNORECASE)
+
+def detect_lang(text: str) -> str:
+    """Very light heuristic: compare common-word hits; require a minimal length."""
+    t = re.sub(r"[^\wñáéíóúüÁÉÍÓÚÜ]+", " ", (text or "").lower())
+    tokens = [w for w in t.split() if w]
+    if len(tokens) < 4:  # too short; don't switch
+        return "unknown"
+    es = sum(1 for w in tokens if w in ES_HINTS)
+    en = sum(1 for w in tokens if w in EN_HINTS)
+    if es >= en + 1:
+        return "es"
+    if en >= es + 1:
+        return "en"
+    # punctuation clues
+    if "¿" in text or "¡" in text:
+        return "es"
+    return "unknown"
 
 # ---------- TwiML builders (SILENT) ----------
 def transfer_twiml(to_number: str) -> str:
@@ -247,17 +278,20 @@ async def media(ws: WebSocket):
 
     # ---------- Session setup ----------
     try:
-        dyn_instructions = (
+        # start with English; we'll auto-lock per-utterance below
+        base_instructions = (
             INSTRUCTIONS +
             f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
             f"- caller_id_last4={caller_last4 or 'unknown'}\n"
-            f"- ALWAYS use timezone: {DEFAULT_TZ}\n" +
-            (
+            f"- ALWAYS use timezone: {DEFAULT_TZ}\n"
+            + (
                 f"- If phone is missing from the user, propose using caller_id_e164 and confirm explicitly: "
                 f"“Is this the best number ending in {caller_last4}?”\n" if caller_last4 else
                 "- If phone is missing from the user, ask for it directly and confirm back the digits.\n"
             )
+            + "\nLANGUAGE LOCK: Respond only in English unless the caller clearly switches languages or asks to switch."
         )
+
         await oai.send_json({
             "type": "session.update",
             "session": {
@@ -271,12 +305,9 @@ async def media(ws: WebSocket):
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
                 "modalities": ["audio", "text"],
-                "input_audio_transcription": {
-                    "model": "gpt-4o-mini-transcribe",
-                    "language": "en",
-                    "prompt": "Transcribe in English. Only switch if the caller speaks a full sentence in another language."
-                },
-                "instructions": dyn_instructions,
+                # omit 'language' to allow auto-detect at first; we will lock after the first full utterance
+                "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
+                "instructions": base_instructions,
                 "tools": tools
             }
         })
@@ -305,6 +336,37 @@ async def media(ws: WebSocket):
     call_map: dict[str, dict] = {}
     user_buf: list[str] = []
     pending_action: dict | None = None
+    reply_lang: str = "en"   # 'en' or 'es'
+
+    async def lock_language(new_lang: str):
+        """Update session to strongly enforce reply language + transcription language."""
+        nonlocal reply_lang
+        if new_lang not in ("en", "es") or new_lang == reply_lang:
+            return
+        reply_lang = new_lang
+        label = "English" if new_lang == "en" else "Spanish"
+        log.info(f"LANGUAGE LOCK → {label}")
+        await oai.send_json({
+            "type": "session.update",
+            "session": {
+                "instructions": (
+                    INSTRUCTIONS +
+                    f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
+                    f"- caller_id_last4={caller_last4 or 'unknown'}\n"
+                    f"- ALWAYS use timezone: {DEFAULT_TZ}\n"
+                    + (
+                        f"- If phone is missing from the user, propose using caller_id_e164 and confirm explicitly: "
+                        f"“Is this the best number ending in {caller_last4}?”\n" if caller_last4 else
+                        "- If phone is missing from the user, ask for it directly and confirm back the digits.\n"
+                    )
+                    + f"\nLANGUAGE LOCK: Respond only in {label}. Do not switch unless the caller clearly continues in the other language or asks to switch."
+                ),
+                "input_audio_transcription": {
+                    "model": "gpt-4o-mini-transcribe",
+                    "language": new_lang
+                }
+            }
+        })
 
     # ---------- Twilio actions ----------
     def do_transfer(reason: str | None = None, to: str | None = None):
@@ -329,12 +391,12 @@ async def media(ws: WebSocket):
         say = "Absolutely—one moment while I connect you." if action.get("type") == "transfer" else "Thanks for calling—ending the call now."
         pending_action = action
         log.info(f"ANNOUNCE queued → {action}")
+        # keep the announcement in the current language
+        if reply_lang == "es":
+            say = "Claro—dame un momento mientras te conecto." if action.get("type") == "transfer" else "Gracias por llamar—voy a finalizar la llamada ahora."
         await oai.send_json({
             "type": "response.create",
-            "response": {
-                "modalities": ["audio", "text"],
-                "instructions": f"Say exactly: \"{say}\" Keep it under 2 seconds."
-            }
+            "response": {"modalities": ["audio", "text"], "instructions": say}
         })
 
     # ---------- Helper: JSON POST ----------
@@ -347,7 +409,6 @@ async def media(ws: WebSocket):
                     data = await resp.json()
                 else:
                     data = await resp.text()
-                # compact log
                 preview = data if isinstance(data, str) else {k: data.get(k) for k in ("status","code","event_id","start_iso")}
                 log.info(f"POST {url} -> {status} {preview}")
                 return status, data
@@ -408,7 +469,7 @@ async def media(ws: WebSocket):
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # When the announcement finishes, run the pending action
+                    # After announcement finishes, run the pending action
                     elif t == "response.done" and pending_action:
                         action = pending_action
                         pending_action = None
@@ -418,11 +479,21 @@ async def media(ws: WebSocket):
                         else:
                             do_hangup(reason=action.get("reason"))
 
-                    # user utterance completed → backup intent
+                    # user utterance completed → language lock + backup intents
                     elif t == "conversation.item.input_audio_transcription.completed":
                         text = "".join(user_buf).strip()
                         user_buf.clear()
                         if text:
+                            # language overrides
+                            if ASK_ES_PAT.search(text):
+                                await lock_language("es")
+                            elif ASK_EN_PAT.search(text):
+                                await lock_language("en")
+                            else:
+                                lang_guess = detect_lang(text)
+                                if lang_guess in ("en","es"):
+                                    await lock_language(lang_guess)
+
                             low = text.lower()
                             if re.search(r"(transfer|connect|human|agent|representative|manager|owner|person\s+in\s+charge|live\s+agent|operator|jeriel)\b", low):
                                 log.info(f"SERVER-INTENT: transfer (from user text): {text!r}")
@@ -479,40 +550,48 @@ async def media(ws: WebSocket):
                                 status, data = await json_post(MAIN_WEBHOOK_URL, payload)
                                 phone_last4 = last4(payload_phone)
 
-                                # n8n often responds 200 for both success & conflict; inspect JSON body
                                 body_status = data.get("status") if isinstance(data, dict) else None
                                 is_booked = (status == 200 and body_status == "booked")
-                                is_conflict = (status in (409, 422)) or (status == 200 and body_status == "conflict_or_error")
+                                is_conflict = (status in (409, 422)) or (status == 200 and body_status in {"conflict","conflict_or_error"})
+
+                                confirm_text_en = (
+                                    f"All set. I’ve scheduled that in Eastern Time. "
+                                    f"I have your email as {payload['email']}"
+                                    + (f" and phone ending in {phone_last4}" if phone_last4 else "")
+                                    + ". You’ll receive confirmation emails with calendar invites. "
+                                    "Anything else I can help you with?"
+                                )
+                                confirm_text_es = (
+                                    f"Listo. Ya programé la cita en horario del Este. "
+                                    f"Tengo tu correo como {payload['email']}"
+                                    + (f" y el número terminando en {phone_last4}" if phone_last4 else "")
+                                    + ". Te llegará un correo con la invitación del calendario. "
+                                    "¿Te ayudo con algo más?"
+                                )
 
                                 if is_booked:
-                                    readback = (
-                                        f"All set. I’ve scheduled that in Eastern Time. "
-                                        f"I have your email as {payload['email']}"
-                                        + (f" and phone ending in {phone_last4}" if phone_last4 else "")
-                                        + ". You’ll receive confirmation emails with calendar invites. "
-                                        "Anything else I can help you with?"
-                                    )
-                                    await oai.send_json({"type": "response.create","response": {"modalities": ["audio","text"], "instructions": readback}})
-                                elif is_conflict:
                                     await oai.send_json({
                                         "type": "response.create",
                                         "response": {
                                             "modalities": ["audio","text"],
-                                            "instructions": (
-                                                "Looks like that time isn’t available. Would you like an earlier or later time the same day, "
-                                                "or a nearby day around that time?"
-                                            )
+                                            "instructions": confirm_text_es if reply_lang=="es" else confirm_text_en
                                         }
                                     })
-                                else:
+                                elif is_conflict:
+                                    text_en = ("Looks like that time isn’t available. Would you like an earlier or later time the same day, "
+                                               "or a nearby day around that time?")
+                                    text_es = ("Parece que esa hora no está disponible. ¿Prefieres un poco más temprano o más tarde ese mismo día, "
+                                               "o un día cercano a esa hora?")
                                     await oai.send_json({
                                         "type": "response.create",
-                                        "response": {
-                                            "modalities": ["audio","text"],
-                                            "instructions": (
-                                                "I couldn’t finalize that just now. Would you like me to try again, or pick a different time?"
-                                            )
-                                        }
+                                        "response": {"modalities": ["audio","text"], "instructions": text_es if reply_lang=="es" else text_en}
+                                    })
+                                else:
+                                    text_en = "I couldn’t finalize that just now. Would you like me to try again, or pick a different time?"
+                                    text_es = "No pude finalizarlo ahora mismo. ¿Quieres que lo intente de nuevo o prefieres otra hora?"
+                                    await oai.send_json({
+                                        "type": "response.create",
+                                        "response": {"modalities": ["audio","text"], "instructions": text_es if reply_lang=="es" else text_en}
                                     })
 
                             # ---- Cancel ----
@@ -524,16 +603,13 @@ async def media(ws: WebSocket):
                                     "email": (args.get("email") or None)
                                 }
                                 if not CANCEL_WEBHOOK_URL:
-                                    log.error("CANCEL_WEBHOOK_URL not set; cannot cancel.")
+                                    text_en = ("I can cancel that, but my cancel line isn’t connected yet. "
+                                               "Could I connect you to the person in charge, or would you like me to take a message?")
+                                    text_es = ("Puedo cancelarlo, pero mi línea de cancelación aún no está conectada. "
+                                               "¿Te conecto con la persona a cargo o quieres dejar un mensaje?")
                                     await oai.send_json({
                                         "type": "response.create",
-                                        "response": {
-                                            "modalities": ["audio","text"],
-                                            "instructions": (
-                                                "I can cancel that, but my cancel line isn’t connected yet. "
-                                                "Could I connect you to the person in charge, or would you like me to take a message?"
-                                            )
-                                        }
+                                        "response": {"modalities": ["audio","text"], "instructions": text_es if reply_lang=="es" else text_en}
                                     })
                                 else:
                                     status, data = await json_post(CANCEL_WEBHOOK_URL, payload)
@@ -543,33 +619,33 @@ async def media(ws: WebSocket):
                                     not_found = (status == 404) or (status == 200 and body_status in {"not_found","conflict_or_error"})
 
                                     if is_cancelled:
-                                        readback = (
-                                            "Done. I’ve canceled your appointment"
-                                            + (f" for the number ending in {phone_last4}" if phone_last4 else "")
-                                            + (f" and email {payload.get('email')}" if payload.get("email") else "")
-                                            + ". Is there anything else I can help you with?"
-                                        )
-                                        await oai.send_json({"type": "response.create","response": {"modalities": ["audio","text"], "instructions": readback}})
-                                    elif not_found:
+                                        text_en = ("Done. I’ve canceled your appointment"
+                                                   + (f" for the number ending in {phone_last4}" if phone_last4 else "")
+                                                   + (f" and email {payload.get('email')}" if payload.get("email") else "")
+                                                   + ". Is there anything else I can help you with?")
+                                        text_es = ("Listo. Cancelé tu cita"
+                                                   + (f" para el número que termina en {phone_last4}" if phone_last4 else "")
+                                                   + (f" y el correo {payload.get('email')}" if payload.get("email") else "")
+                                                   + ". ¿Necesitas algo más?")
                                         await oai.send_json({
                                             "type": "response.create",
-                                            "response": {
-                                                "modalities": ["audio","text"],
-                                                "instructions": (
-                                                    "I couldn’t find an active booking for that name and number. "
-                                                    "Do you use another email or phone I can try?"
-                                                )
-                                            }
+                                            "response": {"modalities": ["audio","text"], "instructions": text_es if reply_lang=="es" else text_en}
+                                        })
+                                    elif not_found:
+                                        text_en = ("I couldn’t find an active booking for that name and number. "
+                                                   "Do you use another email or phone I can try?")
+                                        text_es = ("No pude encontrar una reserva activa con ese nombre y número. "
+                                                   "¿Usas otro correo o teléfono que pueda intentar?")
+                                        await oai.send_json({
+                                            "type": "response.create",
+                                            "response": {"modalities": ["audio","text"], "instructions": text_es if reply_lang=="es" else text_en}
                                         })
                                     else:
+                                        text_en = ("I ran into a problem canceling that. Want me to try again or connect you to the person in charge?")
+                                        text_es = ("Tuve un problema al cancelar. ¿Quieres que lo intente de nuevo o te conecto con la persona a cargo?")
                                         await oai.send_json({
                                             "type": "response.create",
-                                            "response": {
-                                                "modalities": ["audio","text"],
-                                                "instructions": (
-                                                    "I ran into a problem canceling that. Want me to try again or connect you to the person in charge?"
-                                                )
-                                            }
+                                            "response": {"modalities": ["audio","text"], "instructions": text_es if reply_lang=="es" else text_en}
                                         })
 
                             elif name == "transfer_call":
