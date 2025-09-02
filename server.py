@@ -41,6 +41,12 @@ def to_e164(s: str | None) -> str | None:
         return "+1" + digits[-10:]
     return None
 
+def last4(n: str | None) -> str | None:
+    if not n:
+        return None
+    d = re.sub(r"\D", "", n)
+    return d[-4:] if len(d) >= 4 else None
+
 # ---------- BUSINESS PROMPT ----------
 def load_kb():
     try:
@@ -57,7 +63,7 @@ trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
 INSTRUCTIONS = (
     f"You are the {brand} AI receptionist (company based in {loc}). "
-    "Default to ENGLISH, but if the caller speaks another language fluently, switch to that language naturally. "
+    "Start in ENGLISH. Only switch languages after the caller speaks a full sentence in that language or explicitly asks. "
     "Tone: warm, professional, friendly, emotion-aware. Keep replies to 1–2 concise sentences unless asked. "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
@@ -69,7 +75,7 @@ INSTRUCTIONS = (
     " - end_call(reason?) → Politely end the call.\n"
     "IMPORTANT:\n"
     " - For booking/rescheduling: ALWAYS use tz 'America/New_York'. Collect name, email (for confirmations), phone, and time.\n"
-    " - Prefer the callerID phone number; confirm it briefly: “Is this the best number ending in ####?”\n"
+    " - Prefer the callerID phone number; confirm by repeating the actual last 4 digits.\n"
     " - For cancel: need name + (phone OR email). Prefer phone. No time required.\n"
     " - When transferring, first say one short line like: “Absolutely—one moment while I connect you.”\n"
     " - When ending, first say one short line like: “Thanks for calling—ending the call now.”\n"
@@ -77,18 +83,33 @@ INSTRUCTIONS = (
     "TRANSFER INTENT examples: connect me, human, person, agent, manager, person in charge, owner, Jeriel, live agent."
 )
 
-# ---- Discovery-first, flexible behavior (additive) ----
+# ---- Discovery-first, flexible + confirmation rules ----
+INSTRUCTIONS += (
+    "\n\nGREETING VARIANTS:\n"
+    "• On the very first response of the call, start in English and use one of these exact lines:\n"
+    "  - \"Hey, thank you for calling ELvara. What can I help you with?\"\n"
+    "  - \"Hey—thanks for calling ELvara. How can I help you today?\"\n"
+    "  - \"Hi, thanks for calling ELvara. How may I assist you?\"\n"
+    "• Keep it to one sentence; do not add extra lines before the question.\n"
+)
 INSTRUCTIONS += (
     "\n\nDISCOVERY-FIRST, FLEXIBLE SCRIPTING:\n"
     "• When asked “What do you do?” or “How can this help?”, FIRST give a natural 1-sentence answer like: "
     "  “We provide business solutions that save you time and money and help you grow—things like CRM/workflow automations, websites/SEO, and custom apps.” "
     "  THEN immediately ask: “What kind of business do you run so I can tailor examples?”\n"
     "• Be flexible—paraphrase naturally and do NOT stick to any script word-for-word.\n"
-    "• After they share the business, give 1–2 simple, outcome-focused examples for that vertical (no rigid template), then ask one focused follow-up: "
+    "• After they share the business, give 1–2 outcome-focused examples for that vertical, then a focused follow-up: "
     "  “What’s the top thing you want to improve—missed calls, no-shows, follow-ups, scheduling, payments, or job tracking?”\n"
-    "• Pricing & timelines: avoid exact numbers or durations. Explain both depend on needs and integrations; offer a one-week free trial and a tailored quote. "
-    "  Setup time depends on the services (simple receptionist is quick; deeper POS/CRM or custom apps take longer).\n"
+    "• Pricing & timelines: both depend on needs/integrations; offer a one-week free trial and a tailored quote. "
+    "  Setup time depends on chosen services (simple receptionist is quick; deeper POS/CRM or custom apps take longer).\n"
     "• Always offer a next step: (a) live transfer to the person in charge, or (b) book a demo/installation in Eastern Time."
+)
+INSTRUCTIONS += (
+    "\n\nBOOKING EXECUTION + READBACK RULES:\n"
+    "• When you have name, email, phone, and a time, CALL appointment_webhook immediately (booking_type 'book' or 'reschedule').\n"
+    "• Before confirming or right after success, REPEAT BACK the details: name, email, phone (say only the last four digits), and the date/time in Eastern Time.\n"
+    "• Do NOT say goodbye or end the call until the tool returns success or an error.\n"
+    "• On conflict/error: briefly apologize and ask for an earlier/later time or nearby day."
 )
 
 # ---------- TwiML builders (SILENT) ----------
@@ -130,17 +151,18 @@ async def media(ws: WebSocket):
     await ws.accept()
 
     # Wait for Twilio 'start'
-    stream_sid = call_sid = caller_number = None
+    stream_sid = call_sid = caller_number = caller_last4 = None
     try:
         while True:
             first = await asyncio.wait_for(ws.receive_text(), timeout=10)
             data0 = json.loads(first)
             if data0.get("event") == "start":
-                stream_sid   = data0["start"]["streamSid"]
-                call_sid     = data0["start"].get("callSid", "")
-                caller_raw   = data0["start"].get("from") or ""
+                stream_sid    = data0["start"]["streamSid"]
+                call_sid      = data0["start"].get("callSid", "")
+                caller_raw    = data0["start"].get("from") or ""
                 caller_number = to_e164(caller_raw)
-                log.info(f"Twilio stream started: streamSid={stream_sid}, callSid={call_sid}, caller={caller_number!r}")
+                caller_last4  = last4(caller_number)
+                log.info(f"Twilio stream started: streamSid={stream_sid}, callSid={call_sid}, caller_raw={caller_raw!r}, caller_e164={caller_number!r}, last4={caller_last4!r}")
                 break
     except Exception as e:
         log.error(f"Twilio start wait failed: {e}")
@@ -226,12 +248,17 @@ async def media(ws: WebSocket):
 
     # ---------- Session setup ----------
     try:
-        # Bake caller phone and tz rules into runtime instructions
+        # Bake caller phone and tz rules into runtime instructions (with real last-4)
         dyn_instructions = (
             INSTRUCTIONS +
             f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
+            f"- caller_id_last4={caller_last4 or 'unknown'}\n"
             f"- ALWAYS use timezone: {DEFAULT_TZ}\n"
-            "- If phone is missing from the user, propose using caller_id_e164 and confirm last 4 digits.\n"
+            + (
+                f"- If phone is missing from the user, propose using caller_id_e164 and confirm explicitly: "
+                f"“Is this the best number ending in {caller_last4}?”\n" if caller_last4 else
+                "- If phone is missing from the user, ask for it directly and confirm back the digits.\n"
+            )
         )
         await oai.send_json({
             "type": "session.update",
@@ -246,18 +273,27 @@ async def media(ws: WebSocket):
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
                 "modalities": ["audio", "text"],
-                "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
+                "input_audio_transcription": {
+                    "model": "gpt-4o-mini-transcribe",
+                    "language": "en",  # force English to start
+                    "prompt": "Transcribe in English. Only switch if the caller speaks a full sentence in another language."
+                },
                 "instructions": dyn_instructions,
                 "tools": tools
             }
         })
-        # Initial greeting
+        # Initial greeting — choose one of the variants (verbatim)
         await oai.send_json({
             "type": "response.create",
             "response": {
                 "modalities": ["audio", "text"],
                 "tool_choice": "auto",
-                "instructions": "Start in English. Greet briefly and ask how you can help."
+                "instructions": (
+                    "Start in English. Say EXACTLY one of the following (pick naturally, only one line): "
+                    "\"Hey, thank you for calling ELvara. What can I help you with?\" "
+                    "OR \"Hey—thanks for calling ELvara. How can I help you today?\" "
+                    "OR \"Hi, thanks for calling ELvara. How may I assist you?\""
+                )
             }
         })
     except Exception as e:
@@ -441,28 +477,32 @@ async def media(ws: WebSocket):
 
                             # Handle our tools
                             if name == "appointment_webhook":
+                                payload_phone = args.get("phone") or caller_number or ""
                                 payload = {
                                     "tool": "book",
                                     "booking_type": args.get("booking_type", "book"),
                                     "name": args.get("name", "").strip(),
                                     "email": args.get("email", "").strip(),
-                                    "phone": args.get("phone") or caller_number or "",
+                                    "phone": payload_phone,
                                     "tz": DEFAULT_TZ,
                                     "startTime": args.get("startTime", "").strip(),
                                     "event_type_id": int(args.get("event_type_id", EVENT_TYPE_ID)),
                                     "idempotency_key": f"ai-{uuid.uuid4().hex}"
                                 }
                                 status, data = await json_post(MAIN_WEBHOOK_URL, payload)
+                                phone_last4 = last4(payload_phone)
                                 if status == 200:
+                                    # success → short confirmation with readback
+                                    readback = (
+                                        f"All set. I’ve scheduled that in Eastern Time. "
+                                        f"I have your email as {payload['email']}"
+                                        + (f" and phone ending in {phone_last4}" if phone_last4 else "")
+                                        + ". You’ll receive confirmation emails with calendar invites. "
+                                        "Anything else I can help you with?"
+                                    )
                                     await oai.send_json({
                                         "type": "response.create",
-                                        "response": {
-                                            "modalities": ["audio","text"],
-                                            "instructions": (
-                                                "All set. I’ve scheduled that in Eastern Time and sent confirmation emails with calendar invites. "
-                                                "Anything else I can help you with?"
-                                            )
-                                        }
+                                        "response": {"modalities": ["audio","text"], "instructions": readback}
                                     })
                                 elif status in (409, 422):
                                     await oai.send_json({
@@ -507,16 +547,17 @@ async def media(ws: WebSocket):
                                     })
                                 else:
                                     status, data = await json_post(CANCEL_WEBHOOK_URL, payload)
+                                    phone_last4 = last4(payload.get("phone"))
                                     if status == 200:
+                                        readback = (
+                                            "Done. I’ve canceled your appointment"
+                                            + (f" for the number ending in {phone_last4}" if phone_last4 else "")
+                                            + (f" and email {payload.get('email')}" if payload.get("email") else "")
+                                            + ". Is there anything else I can help you with?"
+                                        )
                                         await oai.send_json({
                                             "type": "response.create",
-                                            "response": {
-                                                "modalities": ["audio","text"],
-                                                "instructions": (
-                                                    "Done. I’ve canceled your appointment and sent confirmation emails. "
-                                                    "Is there anything else I can help you with?"
-                                                )
-                                            }
+                                            "response": {"modalities": ["audio","text"], "instructions": readback}
                                         })
                                     else:
                                         await oai.send_json({
