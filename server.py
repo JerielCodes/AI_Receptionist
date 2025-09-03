@@ -17,7 +17,7 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 TRANSFER_NUMBER    = os.getenv("TRANSFER_NUMBER", "")
 TW_SID             = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN           = os.getenv("TWILIO_AUTH_TOKEN", "")
-MAIN_WEBHOOK_URL   = os.getenv("MAIN_WEBHOOK_URL", "")   # book+reschedule+checkAvailableSlot
+MAIN_WEBHOOK_URL   = os.getenv("MAIN_WEBHOOK_URL", "")   # checkAvailableSlot + book/reschedule
 CANCEL_WEBHOOK_URL = os.getenv("CANCEL_WEBHOOK_URL", "")
 EVENT_TYPE_ID      = int(os.getenv("EVENT_TYPE_ID", "3117986"))
 DEFAULT_TZ         = "America/New_York"
@@ -78,8 +78,8 @@ INSTRUCTIONS = (
     "Tone: warm, professional, friendly, concise (1–2 sentences unless asked). "
     f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
     "Never invent business facts; if unsure, say so and offer to connect the caller. "
-    "PRIMARY GOALS: (1) Explain benefits & answer questions; (2) Book a demo/installation; (3) Transfer to a human on request; "
-    "(4) Think like a teammate focused on converting qualified leads."
+    "PRIMARY GOALS: (1) Explain benefits & answer questions; (2) Book a demo/installation; "
+    "(3) Transfer to a human on request; (4) Think like a teammate focused on converting qualified leads."
     "\n\nTOOLS:\n"
     " - check_slots → Always call before booking; silently verifies availability and returns exact/alternates.\n"
     " - appointment_webhook(book|reschedule) → Creates/updates the booking when a time is chosen.\n"
@@ -89,9 +89,11 @@ INSTRUCTIONS = (
     "IMPORTANT WORKFLOW BEHAVIOR:\n"
     " - For booking/rescheduling: ALWAYS use tz 'America/New_York'. Collect name, email (for confirmations), phone, and time.\n"
     " - Prefer the callerID phone; confirm by repeating the last 4 digits.\n"
-    " - Before booking: CALL check_slots with the requested time. If exactMatch=true, proceed to book silently. "
-    "   If not, offer same-day alternates and nearest options, then book the chosen one.\n"
-    " - Read back details after success: name, email, last-4 phone, and the date/time in Eastern Time.\n"
+    " - Before booking: CALL check_slots with the requested time.\n"
+    "     • If exactMatch=true and identity (name+email+phone) is present → book silently using matchedSlot.\n"
+    "     • If exactMatch=true but identity is missing → ask for the missing fields in ONE short sentence, then book using matchedSlot.\n"
+    "     • If no exact match → offer same-day alternates and nearest options; book the chosen one.\n"
+    " - After success, read back: name, email, last-4 phone, and the date/time in Eastern Time.\n"
     " - When transferring, first: “Absolutely—one moment while I connect you.” Then call the tool and stop speaking.\n"
     " - If transfer fails/no-answer, you may be reconnected; offer to book for today/tomorrow after rejoining.\n"
     " - Be natural and persuasive. If the caller is unsure, offer a quick transfer to the Business Solutions Lead."
@@ -151,7 +153,7 @@ async def voice(request: Request):
     log.info(f"Returning TwiML with stream URL: {https_to_wss(base_url.rstrip('/') + '/media')}")
     return PlainTextResponse(vr_xml, media_type="application/xml")
 
-# Twilio sometimes hits /twilio/voice/media → accept and reuse
+# Accept Twilio’s alternate path if configured that way
 @app.websocket("/twilio/voice/media")
 async def media_alias(ws: WebSocket):
     return await media(ws)
@@ -171,6 +173,7 @@ async def after_transfer(request: Request):
         vr = VoiceResponse(); vr.hangup()
         return PlainTextResponse(str(vr), media_type="application/xml")
 
+    # No-answer / busy / failed → reconnect stream
     vr_xml = connect_stream_twiml(PUBLIC_BASE_URL, params={"reason": "transfer_fail"})
     return PlainTextResponse(vr_xml, media_type="application/xml")
 
@@ -304,7 +307,7 @@ async def media(ws: WebSocket):
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
                 "modalities": ["audio", "text"],
-                # **LOCK ASR TO ENGLISH INITIALLY**
+                # Lock ASR to English initially
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
                 "instructions": base_instructions,
                 "tools": tools
@@ -388,7 +391,6 @@ async def media(ws: WebSocket):
             async with session.post(url, json=payload, timeout=20) as resp:
                 ct = (resp.headers.get("content-type") or "")
                 status = resp.status
-                data: dict | str
                 if "application/json" in ct:
                     try:
                         data = await resp.json()
@@ -532,7 +534,7 @@ async def media(ws: WebSocket):
                             if miss:
                                 prompt = prompt_for_missing(miss, last4(args.get("phone") or caller_number), reply_lang)
                                 await oai.send_json({"type": "response.create","response": {"modalities": ["audio","text"], "instructions": prompt}})
-                                continue  # do not call webhook
+                                continue  # do not call webhook with missing data
 
                         if name == "cancel_workflow":
                             # need at least name + (phone OR email)
@@ -562,12 +564,19 @@ async def media(ws: WebSocket):
                             }
                             s1, d1 = await json_post(MAIN_WEBHOOK_URL, payload_chk)
                             body = d1 if isinstance(d1, dict) else {}
-                            exact   = bool(body.get("exactMatch"))
-                            matched = body.get("matchedSlot")
-                            same_day = body.get("sameDayAlternates") or []
-                            nearest  = body.get("nearest") or []
+                            exact     = bool(body.get("exactMatch"))
+                            matched   = body.get("matchedSlot")
+                            same_day  = body.get("sameDayAlternates") or []
+                            nearest   = body.get("nearest") or []
+                            first_day = body.get("firstAvailableThatDay")
 
-                            have_identity = all([(args.get("name") or "").strip(), (args.get("email") or "").strip(), (args.get("phone") or caller_number or "").strip()])
+                            have_identity = all([
+                                (args.get("name") or "").strip(),
+                                (args.get("email") or "").strip(),
+                                (args.get("phone") or caller_number or "").strip()
+                            ])
+
+                            # Exact + identity ⇒ auto-book
                             if exact and matched and have_identity:
                                 payload_book = {
                                     "tool": "book",
@@ -584,30 +593,60 @@ async def media(ws: WebSocket):
                                 s2, d2 = await json_post(MAIN_WEBHOOK_URL, payload_book)
                                 phone_last = last4(payload_book["phone"])
                                 ok = (isinstance(d2, dict) and d2.get("status") == "booked" and s2 == 200)
-                                txt_en = (f"All set. I booked {matched} Eastern Time. "
-                                          f"I have your email as {payload_book['email']}"
-                                          + (f" and phone ending in {phone_last}" if phone_last else "")
-                                          + ". A calendar invite is on its way. Anything else?")
-                                txt_es = (f"Listo. Reservé {matched} hora del Este. "
-                                          f"Tengo tu correo como {payload_book['email']}"
-                                          + (f" y el número terminando en {phone_last}" if phone_last else "")
-                                          + ". Te llegará la invitación del calendario. ¿Algo más?")
-                                await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": txt_es if reply_lang=="es" else txt_en}} if ok else
-                                    {"type":"response.create","response":{"modalities":["audio","text"],"instructions": ("No pude finalizarlo ahora mismo. ¿Intento de nuevo o prefieres otra hora?" if reply_lang=="es" else "I couldn’t finalize that just now. Want me to try again or pick a different time?")}})
-                            else:
-                                if exact and matched:
-                                    txt = (f"Buenas noticias: {matched} (hora del Este) está disponible. ¿Lo reservo o prefieres una de estas horas cercanas: {', '.join(nearest[:3])}?"
-                                           if reply_lang=="es" else
-                                           f"Good news—{matched} Eastern is open. Book that, or would you prefer one of these nearby times: {', '.join(nearest[:3])}?")
+                                if ok:
+                                    txt_en = (f"All set. I booked {matched} Eastern Time. "
+                                              f"I have your email as {payload_book['email']}"
+                                              + (f" and phone ending in {phone_last}" if phone_last else "")
+                                              + ". A calendar invite is on its way. Anything else?")
+                                    txt_es = (f"Listo. Reservé {matched} hora del Este. "
+                                              f"Tengo tu correo como {payload_book['email']}"
+                                              + (f" y el número terminando en {phone_last}" if phone_last else "")
+                                              + ". Te llegará la invitación del calendario. ¿Algo más?")
+                                    await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": txt_es if reply_lang=="es" else txt_en}})
                                 else:
-                                    lead = (f"La primera apertura ese día es {body['firstAvailableThatDay']}. " if reply_lang=="es" and body.get("firstAvailableThatDay") else
-                                            f"The first opening that day is {body['firstAvailableThatDay']}. " if body.get("firstAvailableThatDay") else "")
-                                    options = (same_day or nearest)[:3]
-                                    tail = (f"Opciones cercanas: {', '.join(options)}. ¿Cuál te conviene?"
-                                            if reply_lang=="es" else
-                                            f"Closest options: {', '.join(options) or 'I can check other days too.'} What works best?")
-                                    txt = lead + tail
-                                await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": txt}})
+                                    txt = ("No pude finalizarlo ahora mismo. ¿Intento de nuevo o prefieres otra hora?"
+                                           if reply_lang=="es" else
+                                           "I couldn’t finalize that just now. Want me to try again or pick a different time?")
+                                    await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": txt}})
+                                continue
+
+                            # Exact but missing identity ⇒ compact ask then we’ll book
+                            if exact and matched and not have_identity:
+                                miss = []
+                                if not (args.get("name") or "").strip():  miss.append("name")
+                                if not (args.get("email") or "").strip(): miss.append("email")
+                                if not (args.get("phone") or caller_number or "").strip(): miss.append("phone")
+                                phone_last = last4(caller_number)
+                                if reply_lang == "es":
+                                    ask = (f"Buena noticia: {matched} (hora del Este) está disponible. "
+                                           f"Para reservarlo necesito " +
+                                           ", ".join(["tu nombre" if m=="name" else "tu correo" if m=="email" else "tu número" for m in miss]) +
+                                           (f". Puedo usar el número que termina en {phone_last} si te sirve. " if "phone" in miss and phone_last else ". ") +
+                                           "¿Me lo compartes?")
+                                else:
+                                    ask = (f"Good news—{matched} Eastern is open. "
+                                           f"To lock it in I just need your " +
+                                           ", ".join(["name" if m=="name" else "email" if m=="email" else "best phone" for m in miss]) +
+                                           (f". I can use the number ending in {phone_last} if that works. " if "phone" in miss and phone_last else ". ") +
+                                           "What should I use?")
+                                await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": ask}})
+                                continue
+
+                            # No exact match ⇒ offer alternates
+                            lead_en = f"The first opening that day is {first_day}. " if first_day else ""
+                            lead_es = f"La primera apertura ese día es {first_day}. " if first_day else ""
+                            options = (same_day or nearest)[:3]
+
+                            if reply_lang == "es":
+                                txt = (("Esa hora exacta no está libre. " + lead_es) if not exact else "") + \
+                                      (f"Opciones cercanas: {', '.join(options)}. ¿Cuál te conviene?"
+                                       if options else "También puedo revisar otros días. ¿Qué día prefieres?")
+                            else:
+                                txt = (("That exact time isn’t open. " + lead_en) if not exact else "") + \
+                                      (f"Closest options: {', '.join(options)}. What works best?"
+                                       if options else "I can check other days too—what day works?")
+                            await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": txt}})
+                            continue
 
                         elif name == "appointment_webhook":
                             payload_phone = (args.get("phone") or caller_number or "").strip()
