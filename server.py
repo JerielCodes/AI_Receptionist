@@ -1,6 +1,8 @@
 # server.py
 import os, json, asyncio, logging, aiohttp, re, uuid
 from contextlib import suppress
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Dial
@@ -65,6 +67,7 @@ loc   = KB.get("location", "Philadelphia, PA")
 vals  = " • ".join(KB.get("value_props", [])) or "Custom AI booking • SEO websites • Workflow automations"
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
+# Short, flexible pitch
 PITCH_SHORT_EN = ("We build tailored solutions that save time and help you grow—"
                   "from custom AI-integrated booking and CRM automations to SEO websites and apps that keep you organized. "
                   "Tell me what kind of business you run or the goal you have, and I’ll make it specific.")
@@ -72,39 +75,79 @@ PITCH_SHORT_ES = ("Creamos soluciones a la medida para ahorrar tiempo y ayudarte
                   "desde reservas con IA y automatizaciones CRM hasta sitios SEO y apps para organizarte. "
                   "Cuéntame qué tipo de negocio tienes o tu objetivo y te doy ideas concretas.")
 
-INSTRUCTIONS = (
-    f"You are the {brand} AI receptionist (company based in {loc}). "
-    "Start in ENGLISH. Only switch to Spanish if the caller explicitly asks. "
-    "Tone: warm, professional, friendly, concise (1–2 sentences unless asked). "
-    f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
-    "Never invent business facts; if unsure, say so and offer to connect the caller. "
-    "PRIMARY GOALS: (1) Explain benefits & answer questions; (2) Book a demo/installation; "
-    "(3) Transfer to a human on request; (4) Think like a teammate focused on converting qualified leads."
-    "\n\nTOOLS:\n"
-    " - check_slots → Always call before booking; silently verifies availability and returns exact/alternates.\n"
-    " - appointment_webhook(book|reschedule) → Creates/updates the booking when a time is chosen.\n"
-    " - cancel_workflow(cancel) → Cancels an existing booking.\n"
-    " - transfer_call(to?, reason?) → Bridge to a human now (omit 'to' to use the default).\n"
-    " - end_call(reason?) → Politely end the call.\n"
-    "IMPORTANT WORKFLOW BEHAVIOR:\n"
-    " - For booking/rescheduling: ALWAYS use tz 'America/New_York'. Collect name, email (for confirmations), phone, and time.\n"
-    " - Prefer the callerID phone; confirm by repeating the last 4 digits.\n"
-    " - Before booking: CALL check_slots with the requested time.\n"
-    "     • If exactMatch=true and identity (name+email+phone) is present → book silently using matchedSlot.\n"
-    "     • If exactMatch=true but identity is missing → ask for the missing fields in ONE short sentence, then book using matchedSlot.\n"
-    "     • If no exact match → offer same-day alternates and nearest options; book the chosen one.\n"
-    " - After success, read back: name, email, last-4 phone, and the date/time in Eastern Time.\n"
-    " - When transferring, first: “Absolutely—one moment while I connect you.” Then call the tool and stop speaking.\n"
-    " - If transfer fails/no-answer, you may be reconnected; offer to book for today/tomorrow after rejoining.\n"
-    " - Be natural and persuasive. If the caller is unsure, offer a quick transfer to the Business Solutions Lead."
-    "\n\nGREETING (pick one line, English first turn):\n"
-    "  “Hey, thank you for calling ELvara. What can I help you with?”\n"
-    "  “Hey—thanks for calling ELvara. How can I help you today?”\n"
-    "  “Hi, thanks for calling ELvara. How may I assist you?”\n"
-    "\nPITCH EXAMPLES:\n"
-    f"  EN: {PITCH_SHORT_EN}\n"
-    f"  ES: {PITCH_SHORT_ES}\n"
-)
+def now_context():
+    et = datetime.now(ZoneInfo(DEFAULT_TZ))
+    utc = datetime.now(timezone.utc)
+    return {
+        "now_utc_iso": utc.isoformat(timespec="seconds"),
+        "now_et_iso": et.isoformat(timespec="seconds"),
+        "now_et_date": et.strftime("%Y-%m-%d"),
+        "now_et_time": et.strftime("%H:%M"),
+        "now_et_weekday": et.strftime("%A"),
+    }
+
+def build_instructions(now_ctx: dict, caller_number: str | None, caller_last4: str | None) -> str:
+    INSTRUCTIONS = (
+        f"You are the {brand} AI receptionist (company based in {loc}). "
+        "Start in ENGLISH. Only switch to Spanish if the caller explicitly asks. "
+        "Tone: warm, professional, friendly, concise (1–2 sentences unless asked). "
+        f"Value props: {vals}. Offer the trial when interest is shown: {trial}. "
+        "Never invent business facts; if unsure, say so and offer to connect the caller. "
+        "PRIMARY GOALS: (1) Explain benefits & answer questions; (2) Book a demo/installation; "
+        "(3) Transfer to a human on request; (4) Think like a teammate focused on converting qualified leads."
+        "\n\nTIME CONTEXT (authoritative; do not guess):\n"
+        f" - NOW_UTC: {now_ctx['now_utc_iso']}\n"
+        f" - NOW_ET:  {now_ctx['now_et_iso']} (Eastern Time)\n"
+        f" - TODAY_ET: {now_ctx['now_et_date']} ({now_ctx['now_et_weekday']}) at {now_ctx['now_et_time']}\n"
+        "All scheduling is in Eastern Time. If the caller mentions durations like “in two hours,” evaluate against NOW_ET."
+        "\n\nTOOLS (when & how to use):\n"
+        " 1) check_slots(startTime, search_days=14, ...)\n"
+        "    • ALWAYS call this first before booking.\n"
+        "    • Required: startTime (ISO with offset). If the caller gave only a time-of-day (e.g., “3pm”), assume TODAY in Eastern Time.\n"
+        "    • If caller didn’t specify a day: default to TODAY at the stated time.\n"
+        "    • If nothing is available and no alternates are returned, try again with search_days=30.\n"
+        "    • If exactMatch=true: book matchedSlot (after you have name + email + phone).\n"
+        "    • If exactMatch=false: offer same-day alternates and nearest options, then book the chosen one.\n"
+        "    Examples:\n"
+        "     - Caller: “Can you do 12:30?” → call check_slots with startTime=TODAY 12:30 ET.\n"
+        "     - Caller: “Sometime tomorrow afternoon” → pick 3:00 PM ET tomorrow and call check_slots.\n"
+        "\n 2) appointment_webhook(booking_type, name, email, phone, startTime, ...)\n"
+        "    • Only call after check_slots indicates the selected time is available OR the caller has chosen an alternate.\n"
+        "    • Required fields: booking_type ('book' or 'reschedule'), name, email, phone (prefer callerID), startTime (ISO with offset).\n"
+        "    • After success: briefly read back name, email, last-4 phone, and date/time in ET.\n"
+        "    Example: After exactMatch=true and you have identity → book matchedSlot silently.\n"
+        "\n 3) cancel_workflow(name, phone|email)\n"
+        "    • Need name + (phone OR email). Prefer phone (use callerID when appropriate).\n"
+        "\n 4) transfer_call(to?, reason?)\n"
+        "    • Use when the caller asks for a person/human or is unsure and wants a consult.\n"
+        "    • Say one short line first: “Absolutely—one moment while I connect you.”\n"
+        "    • If no one answers and the call returns to you, offer to book for later today or tomorrow.\n"
+        "\n 5) end_call(reason?)\n"
+        "    • Only if the caller clearly asked to end.\n"
+        "\nBOOKING FLOW SUMMARY:\n"
+        " • Collect name, email, and phone (confirm by repeating the last 4 digits). Use timezone 'America/New_York'.\n"
+        " • check_slots with the requested time. If exact and identity present → appointment_webhook immediately.\n"
+        " • If not exact → propose the firstAvailableThatDay, sameDayAlternates, or nearest options; book chosen.\n"
+        " • Keep responses 1–2 sentences; be natural and focused on outcomes (missed calls, follow-ups, scheduling, payments, job tracking).\n"
+        "\nGREETING (choose one line, first turn):\n"
+        "  “Hey, thank you for calling ELvara. What can I help you with?”\n"
+        "  “Hey—thanks for calling ELvara. How can I help you today?”\n"
+        "  “Hi, thanks for calling ELvara. How may I assist you?”\n"
+        "\nPITCH EXAMPLES:\n"
+        f"  EN: {PITCH_SHORT_EN}\n"
+        f"  ES: {PITCH_SHORT_ES}\n"
+        "\nRUNTIME CONTEXT:\n"
+        f" - caller_id_e164={caller_number or 'unknown'}\n"
+        f" - caller_id_last4={caller_last4 or 'unknown'}\n"
+        f" - ALWAYS use timezone: {DEFAULT_TZ}\n" +
+        (
+            f" - If phone is missing, propose using caller_id_e164 and confirm: “Is this the best number ending in {caller_last4}?”\n"
+            if caller_last4 else
+            " - If phone is missing, ask for it directly and confirm back the digits.\n"
+        ) +
+        "LANGUAGE LOCK: Respond only in English unless the caller explicitly asks for Spanish."
+    )
+    return INSTRUCTIONS
 
 # ---------- TwiML builders ----------
 def transfer_twiml(to_number: str, action_url: str | None = None) -> str:
@@ -128,6 +171,7 @@ def connect_stream_twiml(base_url: str, params: dict | None = None) -> str:
 # ---------- HEALTH ----------
 @app.get("/")
 def health():
+    et = datetime.now(ZoneInfo(DEFAULT_TZ)).isoformat(timespec="seconds")
     return {
         "ok": True,
         "ai_enabled": bool(OPENAI_API_KEY),
@@ -137,6 +181,7 @@ def health():
         "main_webhook": bool(MAIN_WEBHOOK_URL),
         "cancel_webhook": bool(CANCEL_WEBHOOK_URL),
         "public_base_url": bool(PUBLIC_BASE_URL),
+        "now_et": et
     }
 
 # ---------- TWILIO VOICE WEBHOOK ----------
@@ -238,8 +283,8 @@ async def media(ws: WebSocket):
                 "type": "object",
                 "required": ["startTime"],
                 "properties": {
-                    "startTime": {"type": "string", "description": "Requested ISO with offset, e.g., 2025-09-26T11:30:00-04:00"},
-                    "search_days": {"type": "integer", "default": 30},
+                    "startTime": {"type": "string", "description": "Requested ISO with offset, e.g., 2025-09-26T11:30:00-04:00. If only time-of-day is known (e.g. '15:00' or '3pm'), send that and server will assume TODAY in ET."},
+                    "search_days": {"type": "integer", "default": 14},
                     "booking_type": {"type": "string", "enum": ["book", "reschedule"], "default": "book"},
                     "name": {"type": "string"},
                     "email": {"type": "string"},
@@ -287,18 +332,8 @@ async def media(ws: WebSocket):
 
     # ---------- Session setup ----------
     try:
-        base_instructions = (
-            INSTRUCTIONS +
-            f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
-            f"- caller_id_last4={caller_last4 or 'unknown'}\n"
-            f"- ALWAYS use timezone: {DEFAULT_TZ}\n" +
-            (
-                f"- If phone is missing, propose using caller_id_e164 and confirm: "
-                f"“Is this the best number ending in {caller_last4}?”\n" if caller_last4 else
-                "- If phone is missing, ask for it directly and confirm back the digits.\n"
-            ) +
-            "\nLANGUAGE LOCK: Respond only in English unless the caller explicitly asks for Spanish."
-        )
+        now_ctx = now_context()
+        base_instructions = build_instructions(now_ctx, caller_number, caller_last4)
         await oai.send_json({
             "type": "session.update",
             "session": {
@@ -336,6 +371,7 @@ async def media(ws: WebSocket):
     user_buf: list[str] = []
     pending_action: dict | None = None
     reply_lang: str = "en"
+    hangup_ok: bool = False  # guard for end_call
 
     async def lock_language(new_lang: str):
         nonlocal reply_lang
@@ -344,14 +380,11 @@ async def media(ws: WebSocket):
         reply_lang = new_lang
         label = "English" if new_lang == "en" else "Spanish"
         log.info(f"LANGUAGE LOCK → {label}")
+        now_ctx = now_context()
         await oai.send_json({"type": "session.update","session": {
-            "instructions": (
-                INSTRUCTIONS +
-                f"\nRUNTIME CONTEXT:\n- caller_id_e164={caller_number or 'unknown'}\n"
-                f"- caller_id_last4={caller_last4 or 'unknown'}\n"
-                f"- ALWAYS use timezone: {DEFAULT_TZ}\n" +
-                (f"- If phone is missing, propose caller_id_e164 “ending in {caller_last4}”.\n" if caller_last4 else "") +
-                f"\nLANGUAGE LOCK: Respond only in {label}."
+            "instructions": build_instructions(now_ctx, caller_number, caller_last4).replace(
+                "LANGUAGE LOCK: Respond only in English unless the caller explicitly asks for Spanish.",
+                f"LANGUAGE LOCK: Respond only in {label}."
             ),
             "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": new_lang}
         }})
@@ -409,6 +442,59 @@ async def media(ws: WebSocket):
             log.error(f"POST {url} failed: {e}")
             return 0, str(e)
 
+    # ---------- Time parsing helpers for startTime ----------
+    TIME_ONLY_RE = re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", re.IGNORECASE)
+
+    def to_et_iso_from_time_only(time_str: str) -> str | None:
+        """
+        Accepts '3', '15', '3pm', '15:30', '3:30pm' and returns TODAY's ET ISO with offset.
+        If ambiguous (1-12 w/o am/pm), we assume 24h only if >=13; else we DEFAULT TO PM for 1-11 (sales-friendly).
+        """
+        m = TIME_ONLY_RE.match(time_str or "")
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mm = int(m.group(2) or "0")
+        ampm = (m.group(3) or "").lower()
+        if ampm == "am":
+            hour24 = 0 if hh == 12 else hh
+        elif ampm == "pm":
+            hour24 = 12 if hh == 12 else hh + 12
+        else:
+            # no am/pm
+            if hh >= 13:
+                hour24 = hh
+            elif hh == 12:
+                hour24 = 12
+            else:
+                # assume PM for 1..11 to bias toward business hours
+                hour24 = hh + 12
+        et_now = datetime.now(ZoneInfo(DEFAULT_TZ))
+        dt = et_now.replace(hour=hour24, minute=mm, second=0, microsecond=0)
+        return dt.isoformat()
+
+    def normalize_start_time(start_time_raw: str) -> str | None:
+        """
+        If full ISO with offset -> return as-is (validated by parse attempt).
+        If only time-of-day -> convert to TODAY ET ISO.
+        Otherwise return None.
+        """
+        s = (start_time_raw or "").strip()
+        if not s:
+            return None
+        # Try ISO parse
+        try:
+            # If no timezone info present, reject (we only accept with tz or time-only pattern)
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return None
+            return dt.isoformat()
+        except Exception:
+            pass
+        # Try time-only
+        iso = to_et_iso_from_time_only(s)
+        return iso
+
     # ---------- Utility: field validation & prompts ----------
     def missing_fields(required_keys: list[str], args: dict) -> list[str]:
         miss = []
@@ -451,7 +537,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal pending_action, reply_lang
+        nonlocal pending_action, reply_lang, hangup_ok
         try:
             while True:
                 msg = await oai.receive()
@@ -490,10 +576,11 @@ async def media(ws: WebSocket):
                             elif re.search(r"\b(in\s+english|speak\s+english|english\s+please)\b", low):
                                 await lock_language("en")
 
-                            # quick intents
+                            # intents
                             if re.search(r"(transfer|connect|human|agent|representative|manager|owner|person\s+in\s+charge|live\s+agent|operator)\b", low):
                                 await announce_then({"type":"transfer","reason":"user_requested_transfer"})
                             elif re.search(r"(hang\s*up|end\s+the\s+call|that's\s+all|bye|good\s*bye|not\s+interested|we're\s+done|colgar|terminar.*llamada|ad(i|í)os)", low):
+                                hangup_ok = True
                                 await announce_then({"type":"hangup","reason":"user_requested_hangup"})
 
                     elif t == "response.output_item.added":
@@ -553,13 +640,28 @@ async def media(ws: WebSocket):
 
                         # ---- Tools proper ----
                         if name == "check_slots":
-                            startTime   = (args.get("startTime") or "").strip()
-                            search_days = int(args.get("search_days") or 30)
+                            # Normalize startTime: accept ISO-with-offset OR time-only (assume TODAY ET)
+                            raw_start = (args.get("startTime") or "").strip()
+                            norm_start = normalize_start_time(raw_start)
+                            if not norm_start:
+                                ask = ("What day and time should I check (Eastern)? For example: "
+                                       "'Sep 26 at 12:30pm' or 'today 3pm'. "
+                                       "If you only say a time, I’ll assume today.")
+                                if reply_lang == "es":
+                                    ask = ("¿Qué día y hora verifico (horario del Este)? Por ejemplo: "
+                                           "'26 sep a las 12:30pm' o 'hoy 3pm'. "
+                                           "Si solo dices la hora, asumiré hoy.")
+                                await oai.send_json({
+                                    "type": "response.create",
+                                    "response": {"modalities": ["audio","text"], "instructions": ask}
+                                })
+                                continue
+                            search_days = int(args.get("search_days") or 14)
                             payload_chk = {
                                 "tool": "checkAvailableSlot",
                                 "event_type_id": int(args.get("event_type_id", EVENT_TYPE_ID)),
                                 "tz": DEFAULT_TZ,
-                                "startTime": startTime,
+                                "startTime": norm_start,
                                 "search_days": search_days
                             }
                             s1, d1 = await json_post(MAIN_WEBHOOK_URL, payload_chk)
@@ -569,6 +671,17 @@ async def media(ws: WebSocket):
                             same_day  = body.get("sameDayAlternates") or []
                             nearest   = body.get("nearest") or []
                             first_day = body.get("firstAvailableThatDay")
+
+                            # If no options at all, try auto-extend to 30 days once
+                            if (not exact) and (not same_day) and (not nearest) and search_days < 30:
+                                payload_chk["search_days"] = 30
+                                s1b, d1b = await json_post(MAIN_WEBHOOK_URL, payload_chk)
+                                body = d1b if isinstance(d1b, dict) else {}
+                                exact     = bool(body.get("exactMatch"))
+                                matched   = body.get("matchedSlot")
+                                same_day  = body.get("sameDayAlternates") or []
+                                nearest   = body.get("nearest") or []
+                                first_day = body.get("firstAvailableThatDay")
 
                             have_identity = all([
                                 (args.get("name") or "").strip(),
@@ -649,6 +762,8 @@ async def media(ws: WebSocket):
                             continue
 
                         elif name == "appointment_webhook":
+                            if not hangup_ok:  # unrelated to hangup, just keeping guard var around
+                                pass
                             payload_phone = (args.get("phone") or caller_number or "").strip()
                             payload = {
                                 "tool": "book",
@@ -662,6 +777,13 @@ async def media(ws: WebSocket):
                                 "idempotency_key": f"ai-{uuid.uuid4().hex}",
                                 "notes": (args.get("notes") or None)
                             }
+                            # Final guard: require required fields (should be satisfied already)
+                            miss = missing_fields(["booking_type","name","email","phone","startTime"], payload)
+                            if miss:
+                                prompt = prompt_for_missing(miss, last4(payload_phone), reply_lang)
+                                await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": prompt}})
+                                continue
+
                             status, data = await json_post(MAIN_WEBHOOK_URL, payload)
                             body_status = data.get("status") if isinstance(data, dict) else None
                             phone_last4 = last4(payload_phone)
@@ -717,6 +839,14 @@ async def media(ws: WebSocket):
                         elif name == "transfer_call":
                             await announce_then({"type":"transfer","to":(args.get("to") or None),"reason":args.get("reason")})
                         elif name == "end_call":
+                            if not hangup_ok:
+                                confirm = "Do you want me to end the call, or keep going?" if reply_lang=="en" \
+                                          else "¿Quieres que termine la llamada o seguimos?"
+                                await oai.send_json({
+                                    "type":"response.create",
+                                    "response":{"modalities":["audio","text"],"instructions": confirm}
+                                })
+                                continue
                             await announce_then({"type":"hangup","reason":args.get("reason")})
 
                     elif t == "response.output_text.delta":
