@@ -22,8 +22,7 @@ CANCEL_WEBHOOK_URL = os.getenv("CANCEL_WEBHOOK_URL", "")
 EVENT_TYPE_ID      = int(os.getenv("EVENT_TYPE_ID", "3117986"))
 DEFAULT_TZ         = "America/New_York"
 
-# Used to build Twilio callbacks & rejoin streams after failed transfers
-# Example: https://ai-receptionist-xxxx.onrender.com
+# Public base like: https://ai-receptionist-xxxx.onrender.com  (STRONGLY RECOMMENDED)
 PUBLIC_BASE_URL    = os.getenv("PUBLIC_BASE_URL", "")
 
 tw_client = Client(TW_SID, TW_TOKEN) if (TW_SID and TW_TOKEN) else None
@@ -68,7 +67,6 @@ loc   = KB.get("location", "Philadelphia, PA")
 vals  = " • ".join(KB.get("value_props", [])) or "Custom AI booking • SEO websites • Workflow automations"
 trial = KB.get("trial_offer", "One-week free trial; install/uninstall is free.")
 
-# Short, flexible pitch (employee-like, not script-bound)
 PITCH_SHORT_EN = ("We build tailored solutions that save time and help you grow—"
                   "from custom AI-integrated booking and CRM automations to SEO websites and apps that keep you organized. "
                   "Tell me what kind of business you run or the goal you have, and I’ll make it specific.")
@@ -126,7 +124,6 @@ def connect_stream_twiml(base_url: str, params: dict | None = None) -> str:
     conn = vr.connect()
     ws_url = https_to_wss(base_url.rstrip("/") + "/media")
     s = conn.stream(url=ws_url)
-    # Pass lightweight flags back into /media via Twilio customParameters
     if params:
         for k, v in params.items():
             try:
@@ -149,20 +146,30 @@ def health():
         "public_base_url": bool(PUBLIC_BASE_URL),
     }
 
-# ---------- TWILIO VOICE WEBHOOK (initial connect; silent) ----------
+# ---------- TWILIO VOICE WEBHOOK (initial connect; **returns absolute wss://**) ----------
 @app.post("/twilio/voice")
 async def voice(request: Request):
-    # Prefer explicit PUBLIC_BASE_URL; else derive from request
-    base_url = PUBLIC_BASE_URL or f"{request.url.scheme}://{request.url.hostname}"
+    # Build a public base URL Twilio can resolve
+    host = (
+        os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        or request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.hostname
+    )
+    base_url = PUBLIC_BASE_URL or f"https://{host}"
     vr_xml = connect_stream_twiml(base_url, params={"reason": "new"})
-    log.info(f"Returning TwiML with stream URL (initial).")
+    log.info(f"Returning TwiML with stream URL: {https_to_wss(base_url.rstrip('/') + '/media')}")
     return PlainTextResponse(vr_xml, media_type="application/xml")
+
+# ---------- Optional alias: if Twilio ever tries /twilio/voice/media ----------
+@app.websocket("/twilio/voice/media")
+async def media_alias(ws: WebSocket):
+    return await media(ws)  # reuse the same handler
 
 # ---------- AFTER-TRANSFER CALLBACK (handles no-answer/busy/failed) ----------
 @app.post("/twilio/after-transfer")
 async def after_transfer(request: Request):
     if not PUBLIC_BASE_URL:
-        # If we can't rejoin, just end the call
         vr = VoiceResponse()
         vr.hangup()
         return PlainTextResponse(str(vr), media_type="application/xml")
@@ -176,7 +183,6 @@ async def after_transfer(request: Request):
         vr.hangup()
         return PlainTextResponse(str(vr), media_type="application/xml")
 
-    # No-answer / busy / failed → reconnect to AI with a hint
     vr_xml = connect_stream_twiml(PUBLIC_BASE_URL, params={"reason": "transfer_fail"})
     return PlainTextResponse(vr_xml, media_type="application/xml")
 
@@ -201,7 +207,6 @@ async def media(ws: WebSocket):
                 caller_raw    = data0["start"].get("from") or ""
                 caller_number = to_e164(caller_raw)
                 caller_last4  = last4(caller_number)
-                # Twilio custom parameters from <Stream><Parameter>
                 params = (data0["start"].get("customParameters") or {})
                 rejoin_reason = params.get("reason")
                 log.info(f"Twilio stream start: streamSid={stream_sid}, callSid={call_sid}, caller_e164={caller_number!r}, last4={caller_last4!r}, reason={rejoin_reason!r}")
@@ -343,7 +348,6 @@ async def media(ws: WebSocket):
         })
         # First line
         if rejoin_reason == "transfer_fail":
-            # Rejoin fallback
             await oai.send_json({
                 "type": "response.create",
                 "response": {
@@ -356,7 +360,6 @@ async def media(ws: WebSocket):
                 }
             })
         else:
-            # Initial greeting (English)
             await oai.send_json({
                 "type": "response.create",
                 "response": {
@@ -484,7 +487,6 @@ async def media(ws: WebSocket):
                     t = evt.get("type")
                     log.info(f"OAI EVT: {t}")
 
-                    # Debug transcripts
                     if t == "conversation.item.input_audio_transcription.delta":
                         delta = evt.get("delta") or ""
                         user_buf.append(delta)
@@ -492,7 +494,6 @@ async def media(ws: WebSocket):
                     if t == "response.audio_transcript.delta":
                         log.info(f"ASSISTANT>> {evt.get('delta')}")
 
-                    # assistant audio -> Twilio
                     if t == "response.audio.delta" and stream_sid:
                         try:
                             await ws.send_text(json.dumps({
@@ -503,12 +504,10 @@ async def media(ws: WebSocket):
                         except Exception:
                             break
 
-                    # barge-in
                     elif t == "input_audio_buffer.speech_started" and stream_sid:
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
 
-                    # After the announcement finishes, run the pending action
                     elif t == "response.done" and pending_action:
                         action = pending_action
                         pending_action = None
@@ -518,24 +517,20 @@ async def media(ws: WebSocket):
                         else:
                             do_hangup(reason=action.get("reason"))
 
-                    # user utterance completed → simple intent & language locks
                     elif t == "conversation.item.input_audio_transcription.completed":
                         text = "".join(user_buf).strip()
                         user_buf.clear()
                         if text:
                             low = text.lower()
-                            # Language switch requests
                             if re.search(r"\b(en\s+español|habla\s+español|puedes\s+hablar\s+español)\b", low): await lock_language("es")
                             elif re.search(r"\b(in\s+english|speak\s+english|english\s+please)\b", low): await lock_language("en")
                             else:
-                                # light heuristic
                                 toks = re.findall(r"[\wñáéíóúü]+", low)
                                 es = sum(1 for w in toks if w in {"hola","gracias","por","favor","cita","reprogramar","cancelar","mañana","tarde","hoy","disponible"})
                                 en = sum(1 for w in toks if w in {"hello","thanks","please","book","schedule","reschedule","cancel","appointment","tomorrow","afternoon","today","available"})
                                 if es >= en + 2: await lock_language("es")
                                 elif en >= es + 2: await lock_language("en")
 
-                            # backup intents
                             if re.search(r"(transfer|connect|human|agent|representative|manager|owner|person\s+in\s+charge|live\s+agent|operator)\b", low):
                                 log.info(f"SERVER-INTENT: transfer (from user text): {text!r}")
                                 await announce_then({"type":"transfer","reason":"user_requested_transfer"})
@@ -543,7 +538,6 @@ async def media(ws: WebSocket):
                                 log.info(f"SERVER-INTENT: hangup (from user text): {text!r}")
                                 await announce_then({"type":"hangup","reason":"user_requested_hangup"})
 
-                    # PATH A: function call announced
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") == "function_call":
@@ -553,7 +547,6 @@ async def media(ws: WebSocket):
                                 call_map.setdefault(call_id, {"name": name, "args": ""})
                                 log.info(f"FUNC ANNOUNCED: call_id={call_id} name={name}")
 
-                    # PATH B: function args stream in
                     elif t == "response.function_call_arguments.delta":
                         cid   = evt.get("call_id")
                         delta = evt.get("arguments", "")
@@ -592,7 +585,7 @@ async def media(ws: WebSocket):
                                 matched = body.get("matchedSlot")
                                 same_day = body.get("sameDayAlternates") or []
                                 nearest  = body.get("nearest") or []
-                                # If we already have identity AND exact match, auto-book silently
+
                                 have_identity = all([(args.get("name") or "").strip(), (args.get("email") or "").strip(), phone_in])
                                 if exact and matched and have_identity:
                                     payload_book = {
@@ -627,7 +620,6 @@ async def media(ws: WebSocket):
                                                    "¿Quieres que lo intente de nuevo o prefieres otra hora?")
                                         await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": text_es if reply_lang=="es" else text_en}})
                                 else:
-                                    # Present options for the model to offer
                                     if exact and matched:
                                         text_en = (f"Good news—{matched} Eastern is open. Would you like me to book that, "
                                                    f"or would you prefer one of these nearby times: {', '.join(nearest[:3])}?")
@@ -646,7 +638,7 @@ async def media(ws: WebSocket):
                                                    "¿Cuál te conviene?")
                                     await oai.send_json({"type":"response.create","response":{"modalities":["audio","text"],"instructions": text_es if reply_lang=="es" else text_en}})
 
-                            # ---- Book/Reschedule (manual call by the model) ----
+                            # ---- Book/Reschedule ----
                             elif name == "appointment_webhook":
                                 payload_phone = args.get("phone") or caller_number or ""
                                 payload = {
@@ -743,7 +735,6 @@ async def media(ws: WebSocket):
                             elif name == "end_call":
                                 await announce_then({"type":"hangup","reason":args.get("reason")})
 
-                    # text fallbacks just in case
                     elif t == "response.output_text.delta":
                         txt = (evt.get("delta") or "").lower()
                         if any(k in txt for k in ["connecting you", "let me connect", "i'll transfer you", "transfer you now", "patch you through"]):
