@@ -2,31 +2,32 @@
 """
 ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge
 
-IMPORTANT WEBHOOK RULES (read this first):
+IMPORTANT WEBHOOK RULES:
 - NEVER call a webhook until you have the fields it needs.
 - checkAvailableSlot (MAIN_WEBHOOK_URL):
     When: anytime the caller gives a day/time (even vaguely).
     Needs: startTime (ISO with offset), tz, event_type_id, search_days.
     Behavior: if caller isn’t specific, default to TODAY 3:00 PM ET and search the NEXT 14 days.
-    If no exact match: offer same-day + nearest alternatives; if none, expand search_days (→ 30).
+              If no exact match: offer same-day + nearest; if none, expand search_days to 30.
+    UX: Always TELL the caller you’re checking before you call it (“One moment while I check availability…”).
 - book/reschedule (MAIN_WEBHOOK_URL):
     When: after check_slots returns an exact match AND you have name + valid email + phone.
     Needs: booking_type ("book"|"reschedule"), name, email, phone (E.164), startTime (ISO), tz, event_type_id, idempotency_key.
-    Must: read back the email aloud and confirm; repeat last-4 of phone.
+    Must: read the email aloud and confirm; repeat last-4 of phone.
 - cancel (CANCEL_WEBHOOK_URL):
     When: caller asks to cancel.
-    Needs: name + (phone OR email). Prefer phone; use caller ID if they agree.
+    Needs: name + (phone OR email). Prefer phone; can use caller ID if the caller agrees.
 
 VOICE / UX:
-- Default to ENGLISH; only switch if the caller speaks something else. Don’t randomly speak Spanish.
+- Default to ENGLISH; do NOT switch languages unless the caller clearly speaks another language.
 - If you don’t understand, say once: “Sorry—I didn’t catch that, could you repeat?”
   If it happens twice: add “Calls are clearest off speaker/headphones.”
-- If user sounds muffled or very short answers repeatedly, proactively give that tip once.
+- If a webhook might take a second, say “One moment while I check that for you.”
 
 TECH NOTES:
-- We disable model auto-replies (create_response=False) and queue our own responses to avoid
+- Turn detection uses create_response=False; we queue our own responses to avoid
   “conversation_already_has_active_response”.
-- We rejoin the Twilio stream if a ‘stop’ arrives but the call is still live.
+- Heartbeat marks keep Twilio Media Streams alive during silence.
 """
 
 import os, json, asyncio, logging, aiohttp, re, uuid
@@ -113,17 +114,14 @@ def https_to_wss(url: str) -> str:
     return url
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-
 def is_valid_email(v: str | None) -> bool:
     return bool(v and EMAIL_RE.fullmatch(v.strip()))
 
 def default_today_3pm_et_iso() -> str:
     now = datetime.now(ZoneInfo(DEFAULT_TZ))
-    # If it's already after 3pm local, pick next nearest hour today; else 3pm
     target = datetime.combine(now.date(), time(15, 0), tzinfo=ZoneInfo(DEFAULT_TZ))
     if now > target:
-        # next nearest hour, min(now+1h, 7pm)
-        hour = min((now.hour + 1), 19)
+        hour = min((now.hour + 1), 19)  # don’t pick too late
         target = datetime.combine(now.date(), time(hour, 0), tzinfo=ZoneInfo(DEFAULT_TZ))
     return target.isoformat()
 
@@ -296,7 +294,7 @@ async def media(ws: WebSocket):
         with suppress(Exception): await session.close()
         with suppress(Exception): await ws.close()
 
-    # ---------- Tools (schema only; all gating happens in handler) ----------
+    # ---------- Tools (schema only; gating happens in handler) ----------
     tools = [
         {
             "type": "function",
@@ -352,7 +350,7 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 1200,
-                    "create_response": False,            # <<< we will create responses ourselves
+                    "create_response": False,            # we create responses ourselves
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
@@ -384,7 +382,6 @@ async def media(ws: WebSocket):
     user_buf: List[str] = []
     pending_action: Optional[Dict[str,str]] = None
     assistant_busy = False
-    oai_audio_out = 0
 
     async def wait_idle():
         nonlocal assistant_busy
@@ -441,12 +438,6 @@ async def media(ws: WebSocket):
                 elif ev == "stop":
                     reason = (data.get("stop") or {}).get("reason")
                     log.info(f"Twilio sent stop. reason={reason!r}")
-                    # try to rejoin if call still active
-                    if tw_client and ctx and ctx.call_sid and PUBLIC_BASE_URL:
-                        with suppress(Exception):
-                            tw_client.calls(ctx.call_sid).update(
-                                twiml=connect_stream_twiml(PUBLIC_BASE_URL, params={"reason": "rejoin"})
-                            )
                     break
         except asyncio.CancelledError:
             pass
@@ -454,7 +445,7 @@ async def media(ws: WebSocket):
             log.info(f"twilio_to_openai ended: {e}")
 
     async def openai_to_twilio():
-        nonlocal pending_action, assistant_busy, oai_audio_out
+        nonlocal pending_action, assistant_busy
         try:
             while True:
                 msg = await oai.receive()
@@ -468,7 +459,6 @@ async def media(ws: WebSocket):
                         if pending_action:
                             action = pending_action; pending_action = None
                             if action.get("type") == "transfer":
-                                # run after we finish speaking
                                 target = action.get("to") or TRANSFER_NUMBER
                                 if tw_client and ctx and ctx.call_sid and valid_e164(target):
                                     action_url = (PUBLIC_BASE_URL.rstrip("/") + "/twilio/after-transfer") if PUBLIC_BASE_URL else None
@@ -480,7 +470,6 @@ async def media(ws: WebSocket):
                         user_buf.append(evt.get("delta") or "")
 
                     if t == "response.audio.delta" and ctx and ctx.stream_sid:
-                        oai_audio_out += 1
                         try:
                             await ws.send_text(json.dumps({"event":"media","streamSid": ctx.stream_sid,"media":{"payload": evt["delta"]}}))
                         except Exception:
@@ -516,7 +505,7 @@ async def media(ws: WebSocket):
                             await say("Thanks for calling—have a great day!")
                             continue
 
-                        # otherwise let model reply
+                        # otherwise let model reply/tool
                         await respond_naturally()
 
                     # function call wiring
@@ -564,13 +553,20 @@ async def media(ws: WebSocket):
 
     # ---------- Tool handlers ----------
     async def handle_tool_call(tool_name: str, args: Dict[str, Any]):
+        # Explicitly narrate the “checking availability” step
         if tool_name == "check_slots":
             start_time = (args.get("startTime") or "").strip()
             search_days = int(args.get("search_days") or 14)
 
             if not start_time:
-                # default to today 3pm ET
                 start_time = default_today_3pm_et_iso()
+                await say("I can check today at 3:00 PM Eastern and scan the next 14 days. One moment while I check availability.")
+            else:
+                await say("One moment while I check availability for that time.")
+
+            if not MAIN_WEBHOOK_URL:
+                await say("I can check availability once my booking line is connected. Meanwhile, what day generally works for you?")
+                return
 
             payload = {
                 "tool": "checkAvailableSlot",
@@ -579,10 +575,6 @@ async def media(ws: WebSocket):
                 "startTime": start_time,
                 "search_days": search_days
             }
-            if not MAIN_WEBHOOK_URL:
-                await say("I can check availability once my booking line is connected. Meanwhile, what day generally works for you?")
-                return
-
             status, data = await json_post(MAIN_WEBHOOK_URL, payload)
             body = data if isinstance(data, dict) else {}
             exact   = bool(body.get("exactMatch"))
@@ -591,7 +583,7 @@ async def media(ws: WebSocket):
             near    = body.get("nearest") or []
             first_d = body.get("firstAvailableThatDay")
 
-            # store proposed time
+            # remember proposed time
             ctx.collected["startTime"] = matched or start_time
 
             have_identity = all([
@@ -601,7 +593,6 @@ async def media(ws: WebSocket):
             ])
 
             if exact and matched and have_identity:
-                # auto-book
                 await handle_tool_call("appointment_webhook", {
                     "booking_type": "book",
                     "name": (ctx.collected.get("name") or args.get("name")),
@@ -616,11 +607,9 @@ async def media(ws: WebSocket):
                 if not (ctx.collected.get("name") or args.get("name")): miss.append("name")
                 if not is_valid_email(ctx.collected.get("email") or args.get("email")): miss.append("email")
                 if not (ctx.collected.get("phone") or args.get("phone") or ctx.caller_number): miss.append("phone")
-                ask = ("Good news—{t} Eastern is open. To lock it in I just need "
-                       "{need}" + (f". I can use the number ending in {ctx.caller_last4} if that works. " if "phone" in miss and ctx.caller_last4 else ". ") +
-                       "What should I use?")
                 need = ", ".join(["your name" if m=="name" else "an email for confirmation" if m=="email" else "the best phone number" for m in miss])
-                await say(ask.format(t=matched, need=need))
+                tip = f" I can use the number ending in {ctx.caller_last4} if that works." if "phone" in miss and ctx.caller_last4 else ""
+                await say(f"Good news—{matched} Eastern is open. To lock it in I just need {need}.{tip} What should I use?")
                 return
 
             # no exact match
@@ -629,15 +618,14 @@ async def media(ws: WebSocket):
             if options:
                 await say(("That exact time isn’t open. " if not exact else "") + lead + f"Closest options: {', '.join(options)}. What works best?")
             else:
-                # expand search window once
                 if search_days < 30:
+                    # expand once
                     await handle_tool_call("check_slots", {"startTime": start_time, "search_days": 30})
                 else:
                     await say("I don’t see anything nearby that time. Another day might be better—what day works?")
 
         elif tool_name == "appointment_webhook":
             req = ["booking_type","name","email","phone","startTime"]
-            # allow phone fallback to caller ID
             if not args.get("phone") and ctx.caller_number:
                 args["phone"] = ctx.caller_number
 
@@ -653,10 +641,9 @@ async def media(ws: WebSocket):
                 await say("My booking line isn’t connected yet. I can take your details and have Jeriel confirm shortly.")
                 return
 
-            # Read back email for confirmation BEFORE booking (UX)
+            # Read back email for confirmation BEFORE booking
             email = args["email"].strip()
             await say(f"Just to confirm, your email is {email}, correct?")
-            # We proceed immediately; in a stricter flow you could wait for “yes”
 
             payload = {
                 "tool": "book",
@@ -715,9 +702,8 @@ async def media(ws: WebSocket):
                 await say("I hit a snag canceling that. Try again or connect you to the lead?")
 
         elif tool_name == "transfer_call":
-            pending = {"type":"transfer","to": args.get("to"),"reason": args.get("reason")}
             nonlocal pending_action
-            pending_action = pending
+            pending_action = {"type":"transfer","to": args.get("to"),"reason": args.get("reason")}
             await say("Absolutely—one moment while I connect you.")
 
     # ---------- Run pumps ----------
