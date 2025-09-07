@@ -1,25 +1,23 @@
 # server.py
 # ELvara AI Receptionist — Twilio <-> OpenAI Realtime Bridge
 #
-# Drop-in file. Python 3.11+. FastAPI + aiohttp + Twilio
+# ✅ This version forces ENGLISH by default and will NOT switch languages
+#    unless the caller explicitly asks for Spanish. (Transcription language
+#    is pinned to "en"; we also add guardrails in instructions.)
 #
-# ENV required:
+# ✅ Includes robust single-response gating (no overlapping responses),
+#    barge-in cancel, greet-once with “ELvara” in the line, clean “bye”
+#    handling, and reliable booking via your n8n webhooks.
+#
+# ENV VARS (set in Render):
 #   OPENAI_API_KEY
 #   TWILIO_ACCOUNT_SID
 #   TWILIO_AUTH_TOKEN
-#   TRANSFER_NUMBER               (E.164 like +12672134362)  [optional]
-#   PUBLIC_BASE_URL               (e.g., https://your-app.onrender.com)
-#   MAIN_WEBHOOK_URL              (default: https://elevara.app.n8n.cloud/webhook/appointment-webhook)
-#   CANCEL_WEBHOOK_URL            (default: https://elevara.app.n8n.cloud/webhook/appointment-reschedule-2step)
-#   EVENT_TYPE_ID                 (default: 3117986)
-#
-# Changes:
-# - ResponseGate: single-response queue + cancel on barge-in.
-# - Greet-once; no mission line unless asked what we do/how we help.
-# - Strict confirmation of name+email (spell-it-out) before booking.
-# - Reliable booking/cancel handlers for your n8n flows.
-# - Clean “bye” hangup.
-# - “How can you help?” flow asks industry first, then offers tailored services.
+#   TRANSFER_NUMBER                (optional, E.164 like +12672134362)
+#   PUBLIC_BASE_URL                (e.g., https://your-app.onrender.com)
+#   MAIN_WEBHOOK_URL               (defaults to your n8n booking webhook)
+#   CANCEL_WEBHOOK_URL             (defaults to your n8n cancel webhook)
+#   EVENT_TYPE_ID                  (Cal.com event type id; default 3117986)
 
 import os, json, re, uuid, asyncio, logging, aiohttp
 from datetime import datetime, time
@@ -74,12 +72,13 @@ class CallContext:
     state: ConversationState = ConversationState.GREETING
     last_user_input: str = ""
     misunderstand_count: int = 0
-    collected: Dict[str, str] = field(default_factory=dict)          # working memory for name/email/phone/startTime
-    pending_booking: Optional[Dict[str, Any]] = None                 # holds args awaiting confirmation
+    collected: Dict[str, str] = field(default_factory=dict)          # name/email/phone/startTime
+    pending_booking: Optional[Dict[str, Any]] = None
     awaiting_confirmation: bool = False
     greeted: bool = False
     rejoin_reason: Optional[str] = None
     closed: bool = False
+    lang: str = "en"  # 'en' by default. Only switch to 'es' on explicit request.
 
 # ------------- Utilities -------------
 def valid_e164(n: str | None) -> bool:
@@ -111,7 +110,7 @@ def is_valid_email(v: str | None) -> bool:
     return bool(v and EMAIL_RE.fullmatch(v.strip()))
 
 def default_today_anchor_iso() -> str:
-    # Anchor to the current hour (or 3pm if it's earlier), in ET
+    # Anchor to current hour (or 3pm if earlier) in ET
     now = datetime.now(ZoneInfo(DEFAULT_TZ))
     hour = now.hour if now.hour >= 15 else 15
     target = datetime.combine(now.date(), time(hour, 0), tzinfo=ZoneInfo(DEFAULT_TZ))
@@ -121,7 +120,6 @@ def default_today_anchor_iso() -> str:
 BRAND = "ELvara"
 OWNER = "Jeriel"
 MISSION_LINE = "Our mission is growth—handling the systems and strategies that move your business forward."
-
 SERVICES_SHORT = [
     "SEO websites that actually bring customers",
     "AI receptionist & booking",
@@ -130,45 +128,47 @@ SERVICES_SHORT = [
     "CRM setup",
     "Social media management",
 ]
-
 GREETS = [
-    "Hey, thanks for calling ELvara. How can I help you today?",
-    "Hi there, thanks for calling ELvara—what can I do for you?",
-    "Thanks for calling ELvara. What brings you here today?",
+    "Thank you for calling ELvara. How can I help you today?",
+    "Hey—thank you for calling ELvara. How can I help you today?",
+    "Hi, thanks for calling ELvara. How may I assist you?",
 ]
 
 INSTRUCTIONS = f"""
 You are the {BRAND} AI receptionist in Philadelphia, PA. Speak warm, concise (1–2 sentences), professional, conversational.
 
-GREET FIRST:
-- Begin with exactly one natural greeting like: "{GREETS[0]}" or "{GREETS[1]}" or "{GREETS[2]}".
+LANGUAGE:
+- Respond ONLY in English. Do NOT switch languages unless the caller explicitly asks to speak Spanish.
+- If the caller asks for Spanish, acknowledge and switch; otherwise stay in English.
+- If you didn’t hear them: say once “Sorry—I didn’t catch that, could you repeat?”; second time add “Calls are clearest off speaker/headphones.”
 
-MISSION:
-- Only mention this line if they ask "what do you do" or "how can you help": "{MISSION_LINE}"
+GREET FIRST (exactly one line, no mission line yet):
+- "{GREETS[0]}" OR "{GREETS[1]}" OR "{GREETS[2]}"
+
+MISSION (only if they ask what we do or how we can help):
+- "{MISSION_LINE}"
 
 DISCOVERY:
-- If they ask how we can help, FIRST ask what business they run, then suggest 1–2 tailored solutions from:
+- If they ask “how can you help?”, FIRST ask what business they run, then suggest 1–2 tailored solutions from:
   {", ".join(SERVICES_SHORT)}.
 - Keep it outcome-focused. Offer a quick consultation to see what's best.
 
 PRICING:
-- Pricing is bespoke and depends on the business. Say: "Everything is tailored—let’s do a free consultation and then we’ll send a quote."
+- Pricing is bespoke and depends on the business. Say: “Everything is tailored—let’s do a free consultation and then we’ll send a quote.”
 
 BOOKING POLICY:
 - Do NOT book until:
-  1) You've verified a specific time is available via check_slots, and
+  1) You've verified a specific time via check_slots, and
   2) You have name, email, phone, AND you have spelled them out and read them back for confirmation.
-- Ask callers to spell their full name and email letter by letter. Read them back verbatim and ask "Is that correct?"
+- Ask callers to spell their full name and email letter by letter. Read them back verbatim and ask “Is that correct?”
 
 TOOLS:
 - check_slots(startTime, search_days?): FIRST when a time is discussed. If vague, anchor to the current hour (ET) today.
-- appointment_webhook(booking_type, name, email, phone, startTime, notes?): Only AFTER explicit "yes" confirmation of details.
+- appointment_webhook(booking_type, name, email, phone, startTime, notes?): Only AFTER explicit “yes” confirmation of details.
 - cancel_workflow(name, phone|email): Prefer phone (use caller ID if they agree).
 - transfer_call(to?, reason?): Connect to a human immediately when requested.
 
-UX:
-- If you didn’t hear them: say once “Sorry—I didn’t catch that, could you repeat?”; second time add “Calls are clearest off speaker/headphones.”
-- Keep answers short; ask one question at a time; always offer a next step.
+Keep answers short; ask one question at a time; always offer a next step.
 """
 
 # ------------- TwiML builders -------------
@@ -243,7 +243,6 @@ class ResponseGate:
     Ensures only ONE response is active at a time.
     - Queue new responses while one is active.
     - On barge-in, send response.cancel, then drain queue.
-    - Tracks active response id for logging / cancel.
     """
     def __init__(self, oai_ws, log=log):
         self.oai = oai_ws
@@ -256,11 +255,7 @@ class ResponseGate:
 
     async def create(self, instructions: str, modalities: list[str] = ["audio", "text"], tool_choice: str = "auto"):
         if self.closed: return
-        await self.queue.put({
-            "modalities": modalities,
-            "instructions": instructions,
-            "tool_choice": tool_choice,
-        })
+        await self.queue.put({"modalities": modalities, "instructions": instructions, "tool_choice": tool_choice})
         if not self.busy and (self._drainer is None or self._drainer.done()):
             self._drainer = asyncio.create_task(self._drain())
 
@@ -410,7 +405,7 @@ async def media(ws: WebSocket):
         }
     ]
 
-    # Session.update
+    # Session.update (pin transcription to ENGLISH)
     try:
         now_et = datetime.now(ZoneInfo(DEFAULT_TZ))
         now_line = now_et.strftime("%A, %B %d, %Y, %-I:%M %p %Z")
@@ -463,6 +458,23 @@ async def media(ws: WebSocket):
         except Exception as e:
             log.error(f"POST {url} failed: {e}")
             return 0, str(e), ""
+
+    # Language switcher (only on explicit ask)
+    async def maybe_switch_to_spanish(user_text_lower: str):
+        nonlocal ctx
+        if ctx.lang == "en" and re.search(r"\b(spanish|español)\b", user_text_lower):
+            ctx.lang = "es"
+            # Update transcription + a brief acknowledgement in English, then Spanish
+            await oai.send_json({
+                "type":"session.update",
+                "session":{
+                    "input_audio_transcription":{"model":"gpt-4o-mini-transcribe","language":"es"},
+                    "instructions": INSTRUCTIONS + "\n(Caller requested Spanish. From now on, reply in Spanish.)\n"
+                }
+            })
+            await say("Claro, puedo hablar en español. ¿En qué puedo ayudarte?")
+            return True
+        return False
 
     # Pumps ----------------------------------------------------------------
     async def twilio_to_openai():
@@ -547,18 +559,21 @@ async def media(ws: WebSocket):
                         else:
                             ctx.misunderstand_count = 0
 
+                        # Language: switch to Spanish only if explicitly requested
+                        if await maybe_switch_to_spanish(low):
+                            continue
+
                         # Goodbye intent
                         if re.search(r"\b(goodbye|bye|hang\s*up|we'?re\s+done|that'?s\s+all|end\s+the\s+call)\b", low):
                             ctx.state = ConversationState.CLOSING
                             await say("Thanks for calling—have a great day!")
                             ctx.closed = True
-                            # Let the last audio flush then close sockets
                             asyncio.create_task(asyncio.sleep(0.8))
                             break
 
                         # Transfer intent
                         if re.search(r"\b(transfer|connect|human|agent|representative|manager|owner|operator|jeriel)\b", low):
-                            pending_transfer = {"type":"transfer","reason":"user_requested"}
+                            pending_transfer = {"type":"transfer","to": None}
                             await say("Absolutely—one moment while I connect you.")
                             continue
 
@@ -635,7 +650,6 @@ async def media(ws: WebSocket):
             # Keep the candidate time in ctx
             ctx.collected["startTime"] = matched or start_time
 
-            # If exact match: proceed to collect identity (name/email/phone) with spelling
             if exact and matched:
                 ctx.state = ConversationState.CONFIRMING
                 await say(f"Great—{matched} Eastern is open. To lock it in, please tell me your full name and email, spelling each letter.")
@@ -684,7 +698,7 @@ async def media(ws: WebSocket):
                 await say(confirm_line)
                 return
 
-            # Proceed to book (forced after explicit "yes")
+            # Proceed to book (forced after explicit “yes”)
             payload = {
                 "tool": "book",
                 "booking_type": (args.get("booking_type") or "book"),
@@ -704,7 +718,6 @@ async def media(ws: WebSocket):
                 await say("All set—your consultation is on the calendar. You’ll get an email with the details and a calendar invite. Anything else I can help with?")
                 ctx.state = ConversationState.BOOKING
             elif status in (409, 422) or bstat in {"conflict","conflict_or_error"}:
-                # If conflict, ask for alternates
                 sug = body.get("suggestions") or []
                 if sug:
                     await say(f"Looks like that time was taken. I can do {', '.join(sug[:3])}. What works?")
