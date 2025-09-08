@@ -1,25 +1,22 @@
 # server.py
 """
-ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge (stable)
+ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge (stable, guided booking/reschedule/cancel)
 
-What this build fixes:
-- Language lock: ENGLISH only unless the caller explicitly requests Spanish.
-- Greet-once: “Thank you for calling ELvara...” exactly once, never re-greets.
-- No pre-emptive booking: tools only run AFTER a real user utterance & intent.
-- Robust response gate: one active response at a time (no overlap). Cancels
-  only when an active response exists (no response_cancel_not_active spam).
-- Clean end intent: single goodbye → hang up via Twilio REST and close sockets.
-- Booking path: check → collect/confirm by spelling name/email → read-back →
-  ask “Is that correct?” → only then book (idempotency key). Handles 409/422.
+What this build adds:
+- Language discipline: Speak ENGLISH ONLY unless caller explicitly asks to switch languages (no language named).
+- Deterministic booking confirmation: a spoken “yes/correct” after the read-back immediately triggers the booking tool.
+- Guided cancellation: collect identifiers (name + email or phone), read back, confirm, then call cancel webhook.
+- Reschedule path: same as booking but with booking_type="reschedule".
+- Response single-flight with barge-in cancel, greet-once, and clean hang-up.
 
-Env you can set (or rely on the defaults below):
+Environment (or defaults):
 - OPENAI_API_KEY
-- TRANSFER_NUMBER           (E.164, e.g. +12672134362)
+- TRANSFER_NUMBER
 - TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN
-- MAIN_WEBHOOK_URL          (defaults to your n8n booking endpoint)
-- CANCEL_WEBHOOK_URL        (defaults to your n8n cancel endpoint)
-- EVENT_TYPE_ID             (Cal.com type id)
-- PUBLIC_BASE_URL           (e.g. https://your-app.onrender.com)
+- MAIN_WEBHOOK_URL          (n8n appointment endpoint)
+- CANCEL_WEBHOOK_URL        (n8n cancel endpoint)
+- EVENT_TYPE_ID
+- PUBLIC_BASE_URL
 """
 
 import os, json, asyncio, logging, aiohttp, re, uuid
@@ -31,7 +28,7 @@ from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Dial
 from twilio.rest import Client
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 # ---------- LOGGING ----------
@@ -45,7 +42,6 @@ OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 TRANSFER_NUMBER    = os.getenv("TRANSFER_NUMBER", "")
 TW_SID             = os.getenv("TWILIO_ACCOUNT_SID", "")
 TW_TOKEN           = os.getenv("TWILIO_AUTH_TOKEN", "")
-# Defaults to your provided n8n endpoints
 MAIN_WEBHOOK_URL   = os.getenv("MAIN_WEBHOOK_URL", "https://elevara.app.n8n.cloud/webhook/appointment-webhook")
 CANCEL_WEBHOOK_URL = os.getenv("CANCEL_WEBHOOK_URL", "https://elevara.app.n8n.cloud/webhook/appointment-reschedule-2step")
 EVENT_TYPE_ID      = int(os.getenv("EVENT_TYPE_ID", "3117986"))
@@ -74,16 +70,26 @@ class CallContext:
     state: ConversationState = ConversationState.GREETING
     last_user_input: str = ""
     misunderstand_count: int = 0
-    lang: str = "en"  # hard-lock to English unless explicitly switched
-    # Scheduling intent gating
+    lang: str = "en"  # speak English unless explicitly asked to switch
+
+    # Intent flags
     heard_any_user_utterance: bool = False
     user_intends_scheduling: bool = False
-    # Identity & confirmation
+    user_intends_cancel: bool = False
+    user_intends_reschedule: bool = False
+
+    # Identity being collected
     pending_name: Optional[str] = None
     pending_email: Optional[str] = None
     pending_phone: Optional[str] = None
+
+    # Time being collected
     pending_time_iso: Optional[str] = None
-    awaiting_confirmation: bool = False  # waiting for "yes / correct" after read-back
+
+    # Confirmation
+    awaiting_confirmation: bool = False   # read-back done; waiting for yes/no
+    confirm_action: Optional[str] = None  # "book"|"reschedule"|"cancel"
+
     closing: bool = False
 
 # ---------- UTILS ----------
@@ -93,10 +99,9 @@ def valid_e164(n: str | None) -> bool:
 def to_e164(s: str | None) -> str | None:
     if not s: return None
     s = s.strip()
-    if s.startswith("+"):
-        digits = re.sub(r"\D", "", s)
-        return f"+{digits}" if len(digits) >= 8 else None
     digits = re.sub(r"\D", "", s)
+    if s.startswith("+"):
+        return f"+{digits}" if len(digits) >= 8 else None
     if len(digits) >= 10:
         return "+1" + digits[-10:]
     return None
@@ -117,7 +122,7 @@ def is_valid_email(v: str | None) -> bool:
 
 def default_today_anchor_iso() -> str:
     now = datetime.now(ZoneInfo(DEFAULT_TZ))
-    # If it’s before 3pm, propose 3pm; else next whole hour (up to 7pm) as anchor
+    # If before 3pm, propose 3pm; else next whole hour up to 7pm
     anchor = datetime.combine(now.date(), time(15, 0), tzinfo=ZoneInfo(DEFAULT_TZ))
     if now > anchor:
         hour = min(now.hour + 1, 19)
@@ -127,10 +132,16 @@ def default_today_anchor_iso() -> str:
 def detect_schedule_intent(txt: str) -> bool:
     low = txt.lower()
     return any(w in low for w in [
-        "book", "schedule", "reschedule", "set up", "appointment",
+        "book", "schedule", "set up", "appointment", "consult",
         "today", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday",
         "am", "pm", "noon", "evening", "morning"
     ])
+
+def detect_reschedule_intent(txt: str) -> bool:
+    return bool(re.search(r"\b(reschedul(e|ing)|move|change\s+the\s+time)\b", txt.lower()))
+
+def detect_cancel_intent(txt: str) -> bool:
+    return bool(re.search(r"\b(cancel|call\s+off|can you remove)\b", txt.lower()))
 
 # ---------- BUSINESS KB ----------
 def load_kb():
@@ -142,40 +153,36 @@ def load_kb():
 
 KB    = load_kb()
 brand = KB.get("brand", "ELvara")
-loc   = KB.get("location", "Philadelphia, PA")
 greetings = KB.get("greeting_templates", {}).get("primary", [
     "Thank you for calling ELvara. How can I help you today?",
-    "Hey—thanks for calling ELvara. How can I help you today?",
-    "Hi, thanks for calling ELvara. How may I assist you?"
 ])
 
-elevator = (KB.get("value_proposition", {}).get("elevator_pitch")
-            or "We build custom business solutions that save you time and help you grow—AI receptionists, booking systems, SEO websites, and workflow automations.")
 mission_slogan = "Our mission is growth—handling the systems and strategies that move your business forward."
 pricing_line = "Everything is tailored to your business. We start with a free consultation, then provide a quote that fits exactly what you need."
-
 solutions_short = "We help with SEO websites, AI booking, automations, POS, CRM, and social media management."
 
 # ---------- INSTRUCTIONS ----------
 INSTRUCTIONS = f"""
-System rules for the assistant voice:
+System rules for the voice assistant:
 - Speak ENGLISH ONLY unless the caller explicitly asks to switch languages. Do NOT switch on your own.
 - Say the brand name exactly as “ELvara”.
 - Keep replies brief (1–2 sentences) unless asked for more.
 - If asked “what do you do?”, mention: “{mission_slogan}” and briefly list: {solutions_short}.
 - If asked “how can you help?”, ask what business they run FIRST, then offer 1–2 specific solutions from: SEO websites, AI booking, automations, POS, CRM, social media management.
-- If asked about price: say pricing is tailored, free consultation first; then a custom quote. Offer to book a call.
-- For unclear audio, if you don’t understand: say once “Sorry—I didn’t catch that, could you repeat?”
-  If it happens twice: add “Calls are clearest off speaker/headphones.”
+- If asked about price: pricing is tailored; free consultation first; then a custom quote. Offer to book a call.
+- If audio is unclear: say once “Sorry—I didn’t catch that, could you repeat?”; if it happens twice add “Calls are clearest off speaker/headphones.”
 
-Scheduling guardrails:
-- NEVER call tools until you hear at least one user utterance (a real sentence) AND they show scheduling intent.
-- When collecting details, ask the caller to SPELL their full name and email letter-by-letter.
-- ALWAYS read back the name and email and ask “Is that correct?” before booking.
-- Book only after they say yes/correct.
-
-Transfer:
-- If they ask for a human/owner/representative, say “Absolutely—one moment while I connect you.” then transfer.
+Scheduling/cancellation guardrails:
+- Don’t call any tools until you’ve heard at least one complete user utterance AND detected intent.
+- Booking/Reschedule:
+  1) Confirm availability with a check.
+  2) Ask the caller to SPELL full name and email, and collect phone (caller ID acceptable if they agree).
+  3) Read back name, email, phone last-4, and the ET time. Ask “Is that correct?”
+  4) Only after they say yes/correct, proceed to book/reschedule.
+- Cancellation:
+  1) Collect name, plus email OR phone.
+  2) Read back the identifiers you will use. Ask “Is that correct?”
+  3) Only after they say yes/correct, proceed to cancel.
 """
 
 # ---------- TwiML ----------
@@ -353,7 +360,7 @@ async def media(ws: WebSocket):
         {
             "type": "function",
             "name": "cancel_workflow",
-            "description": "Cancel booking (name + phone OR email). Prefer phone.",
+            "description": "Cancel booking (name + phone OR email). Prefer phone if both available.",
             "parameters": {
                 "type": "object",
                 "required": ["name"],
@@ -373,27 +380,25 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 1200,
-                    "create_response": False,  # we create responses through the gate
+                    "create_response": False,
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
                 "modalities": ["audio","text"],
-                # HARD LOCK transcription to English
+                # Transcription: keep EN to avoid drift; switch languages only if asked (we still speak English by rule)
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
                 "instructions": (
                     INSTRUCTIONS +
                     f"\nCURRENT_TIME_ET: {now_line}\nTIMEZONE: {DEFAULT_TZ}\n"
-                    "Remember: reply in ENGLISH unless the caller explicitly asks to switch.\n"
+                    "Always reply in ENGLISH unless explicitly asked to switch languages.\n"
                 ),
                 "tools": tools
             }
         })
-
-        # Initial greeting (once)
-        greet_text = greetings[0]
-        await send_response({"modalities": ["audio","text"], "instructions": greet_text})
+        # Greeting
+        await send_response({"modalities": ["audio","text"], "instructions": greetings[0]})
         ctx.greeted = True
 
     except Exception as e:
@@ -423,7 +428,7 @@ async def media(ws: WebSocket):
             log.error(f"POST {url} failed: {e}")
             return 0, str(e)
 
-    # ---------- Twilio→OpenAI ----------
+    # ---------- Twilio→OpenAI pump ----------
     async def twilio_to_openai():
         try:
             while True:
@@ -442,7 +447,7 @@ async def media(ws: WebSocket):
         except Exception as e:
             log.info(f"twilio_to_openai ended: {e}")
 
-    # ---------- OpenAI→Twilio ----------
+    # ---------- OpenAI→Twilio pump ----------
     async def openai_to_twilio():
         nonlocal assistant_busy, active_response_id, closing_sent
         try:
@@ -466,14 +471,13 @@ async def media(ws: WebSocket):
                         active_response_id = None
                         if ctx.closing and not closing_sent:
                             closing_sent = True
-                            # End call via Twilio then cleanup
                             if tw_client and ctx.call_sid:
                                 with suppress(Exception):
                                     tw_client.calls(ctx.call_sid).update(status="completed")
                             await asyncio.sleep(0.2)
                             break
 
-                    # Stream audio to Twilio
+                    # Stream audio
                     elif t == "response.audio.delta" and ctx and ctx.stream_sid:
                         try:
                             await ws.send_text(json.dumps({"event":"media","streamSid": ctx.stream_sid,"media":{"payload": evt["delta"]}}))
@@ -499,15 +503,14 @@ async def media(ws: WebSocket):
                         ctx.last_user_input = text
                         low = text.lower()
 
-                        # Language switch ONLY if explicitly asked
-                        if ("spanish" in low) or ("español" in low):
-                            ctx.lang = "es"
+                        # Optional language switch (only if explicitly asked: “can you speak X”)
+                        if re.search(r"\b(can you|could you|please)\s+(speak|talk)\s+(in|)\s*[a-zA-ZÀ-ÿ]+\b", low):
                             await send_response({"modalities":["audio","text"], "instructions":
-                                "Claro. Puedo hablar en español. ¿En qué negocio trabajas y qué objetivo tienes?"})
+                                "I’m set to speak English on this line. I can connect you to a human if you’d like."})
                             continue
 
                         # Clarity rules
-                        if len(text.split()) <= 2:
+                        if len(text.split()) <= 2 and not ctx.awaiting_confirmation:
                             ctx.misunderstand_count += 1
                             tip = " Calls are clearest off speaker or headphones." if ctx.misunderstand_count >= 2 else ""
                             await send_response({"modalities":["audio","text"], "instructions": "Sorry—I didn’t catch that, could you repeat?" + tip})
@@ -515,14 +518,45 @@ async def media(ws: WebSocket):
                         else:
                             ctx.misunderstand_count = 0
 
-                        # Detect scheduling intent for gating
-                        if detect_schedule_intent(text):
-                            ctx.user_intends_scheduling = True
+                        # High-level intents
+                        if detect_reschedule_intent(text): ctx.user_intends_reschedule = True
+                        if detect_cancel_intent(text):     ctx.user_intends_cancel = True
+                        if detect_schedule_intent(text):   ctx.user_intends_scheduling = True
 
-                        # Transfer intent
+                        # Deterministic confirmation handler (YES/NO) for book/reschedule/cancel
+                        if ctx.awaiting_confirmation and ctx.confirm_action:
+                            if re.search(r"\b(yes|correct|that'?s\s+right|sounds\s+good|confirm)\b", low):
+                                action = ctx.confirm_action
+                                ctx.awaiting_confirmation = False
+                                ctx.confirm_action = None
+
+                                if action in ("book","reschedule"):
+                                    await handle_tool_call("appointment_webhook", {
+                                        "booking_type": action,
+                                        "name":  ctx.pending_name  or "",
+                                        "email": ctx.pending_email or "",
+                                        "phone": ctx.pending_phone or "",
+                                        "startTime": ctx.pending_time_iso or ""
+                                    })
+                                elif action == "cancel":
+                                    await handle_tool_call("cancel_workflow", {
+                                        "name":  ctx.pending_name  or "",
+                                        "email": ctx.pending_email or "",
+                                        "phone": ctx.pending_phone or ""
+                                    })
+                                continue
+
+                            if re.search(r"\b(no|not\s+correct|change|edit|wrong)\b", low):
+                                ctx.awaiting_confirmation = False
+                                act = ctx.confirm_action or "that"
+                                ctx.confirm_action = None
+                                await send_response({"modalities":["audio","text"], "instructions":
+                                    f"No problem—what should I correct for the {act}: your name, email, phone, or the time?"})
+                                continue
+
+                        # Transfer to human
                         if re.search(r"\b(transfer|connect|human|agent|representative|manager|owner|live\s+agent|operator|jeriel)\b", low):
                             await send_response({"modalities":["audio","text"], "instructions": "Absolutely—one moment while I connect you."})
-                            # After done, do the transfer
                             if tw_client and ctx.call_sid and valid_e164(TRANSFER_NUMBER):
                                 with suppress(Exception):
                                     action_url = (PUBLIC_BASE_URL.rstrip("/") + "/twilio/after-transfer") if PUBLIC_BASE_URL else None
@@ -535,34 +569,65 @@ async def media(ws: WebSocket):
                             await send_response({"modalities":["audio","text"], "instructions": "Thanks for calling—have a great day!"})
                             continue
 
-                        # Q: “what do you do?”
+                        # Mission / pricing / discovery
                         if re.search(r"\b(what\s+do\s+you\s+do|what\s+can\s+you\s+do|how\s+do\s+you\s+help|what\s+are\s+you)\b", low):
                             await send_response({"modalities":["audio","text"], "instructions":
                                 f"{mission_slogan} We build SEO websites, AI booking, automations, POS, CRM, and social media systems that fit your business. What kind of business are you running?"})
                             continue
 
-                        # Q: pricing
                         if re.search(r"\b(price|pricing|cost|how\s+much)\b", low):
                             await send_response({"modalities":["audio","text"], "instructions":
                                 f"{pricing_line} If you’d like, I can book a quick consultation—what day and time work?"})
                             ctx.user_intends_scheduling = True
                             continue
 
-                        # If they asked “how can you help?”
-                        if re.search(r"\b(how\s+can\s+you\s+help|help\s+me)\b", low):
+                        # Cancellation guided start
+                        if ctx.user_intends_cancel:
+                            # Ensure we have identifiers
+                            need_name  = not ctx.pending_name
+                            need_email = not ctx.pending_email
+                            need_phone = not ctx.pending_phone
+                            if need_name:
+                                await send_response({"modalities":["audio","text"], "instructions":
+                                    "To cancel, I’ll just need your full name, plus your email or phone. Please SPELL your full name."})
+                                continue
+                            if need_email and need_phone:
+                                await send_response({"modalities":["audio","text"], "instructions":
+                                    "Thanks. Do you want to use your email or your phone number for the lookup?"})
+                                continue
+                            # Once we have enough, read back and confirm
+                            masked = last4(ctx.pending_phone) or "unknown"
+                            who = f"name {ctx.pending_name}; " + (f"email {ctx.pending_email}" if ctx.pending_email else f"phone ending in {masked}")
                             await send_response({"modalities":["audio","text"], "instructions":
-                                "Happy to help—what kind of business do you run? I’ll suggest the best mix of SEO site, AI booking, automations, POS, CRM, or social media."})
+                                f"Just to confirm, I’ll cancel the appointment for {who}. Is that correct?"})
+                            ctx.awaiting_confirmation = True
+                            ctx.confirm_action = "cancel"
                             continue
 
-                        # If they want to schedule but didn’t give a time yet
+                        # Reschedule / Schedule prompt sequencing
+                        if ctx.user_intends_reschedule:
+                            if not ctx.pending_time_iso:
+                                await send_response({"modalities":["audio","text"], "instructions":
+                                    "What day and time would you like instead?"})
+                                continue
+                            # If we have a new time but no identity, collect identity
+                            if not (ctx.pending_name and (ctx.pending_email or ctx.pending_phone)):
+                                await send_response({"modalities":["audio","text"], "instructions":
+                                    "To reschedule, I’ll need your full name spelled, plus your email or phone."})
+                                continue
+                            # We’ll call check_slots via tool when tool events occur; otherwise nudge
+                            await send_response({"modalities":["audio","text"], "instructions":
+                                "Let me verify that time. One moment."})
+                            continue
+
                         if ctx.user_intends_scheduling and not ctx.pending_time_iso:
                             await send_response({"modalities":["audio","text"], "instructions":
-                                "What day and time work best? If you’d like, we can look at options starting from this afternoon."})
+                                "What day and time work best? We can start from this afternoon."})
                             continue
 
-                        # Otherwise, natural follow-up
+                        # Default discovery
                         await send_response({"modalities":["audio","text"], "instructions":
-                            "Got it. Tell me a bit about your business and your current goals—then we’ll pick the best next step."})
+                            "Got it. Tell me a bit about your business and your goals—then we’ll pick the best next step."})
 
                     # Tool call wiring
                     elif t == "response.output_item.added":
@@ -598,19 +663,19 @@ async def media(ws: WebSocket):
 
     # ---------- Tool handlers ----------
     async def handle_tool_call(tool_name: str, args: Dict[str, Any]):
-        # BLOCK tools until we heard a real utterance & intent
-        if not ctx.heard_any_user_utterance or (tool_name.startswith("check") and not ctx.user_intends_scheduling):
+        # Gate tools until heard speech & have intent for check/booking
+        if not ctx.heard_any_user_utterance:
             await send_response({"modalities":["audio","text"], "instructions":
-                "Happy to set that up. What day and time work best?"})
+                "Happy to help. What day and time works best?"})
             return
 
         if tool_name == "check_slots":
-            start_time = (args.get("startTime") or "").strip()
+            start_time = (args.get("startTime") or ctx.pending_time_iso or "").strip()
             search_days = int(args.get("search_days") or 14)
             if not start_time:
                 start_time = default_today_anchor_iso()
 
-            ctx.pending_time_iso = start_time  # keep anchor
+            ctx.pending_time_iso = start_time
 
             if not MAIN_WEBHOOK_URL:
                 await send_response({"modalities":["audio","text"], "instructions":
@@ -630,46 +695,49 @@ async def media(ws: WebSocket):
             matched = body.get("matchedSlot")
             same    = body.get("sameDayAlternates") or []
             near    = body.get("nearest") or []
-            first_d = body.get("firstAvailableThatDay")
 
             if exact and matched:
-                # Ask for identity with spelling instructions
                 ctx.pending_time_iso = matched
                 ctx.state = ConversationState.CONFIRMING
-                await send_response({"modalities":["audio","text"], "instructions":
-                    f"{matched} Eastern is available. To lock it in, please SPELL your full name slowly."})
+                # Ensure identity is collected next
+                if not ctx.pending_name:
+                    await send_response({"modalities":["audio","text"], "instructions":
+                        f"{matched} Eastern is open. To lock it in, please SPELL your full name slowly."})
+                elif not (ctx.pending_email or ctx.pending_phone):
+                    await send_response({"modalities":["audio","text"], "instructions":
+                        "Great—please spell your email, or tell me the phone number you’d like to use."})
+                else:
+                    last = last4(ctx.pending_phone)
+                    act = "reschedule" if ctx.user_intends_reschedule else "book"
+                    await send_response({"modalities":["audio","text"], "instructions":
+                        f"Confirming {act}: name {ctx.pending_name}; email {ctx.pending_email or '—'}; phone ending in {last or 'unknown'}; time {matched} Eastern. Is that correct?"})
+                    ctx.awaiting_confirmation = True
+                    ctx.confirm_action = "reschedule" if ctx.user_intends_reschedule else "book"
                 return
 
-            # no exact match
+            # No exact match → offer options
             options = (same or near)[:3]
-            lead = f"The first opening that day is {first_d}. " if first_d else ""
             if options:
                 await send_response({"modalities":["audio","text"], "instructions":
-                    (("That exact time isn’t open. " if not exact else "") + lead +
-                     f"Closest options: {', '.join(options)}. What works best?")})
+                    f"That exact time isn’t open. Closest options: {', '.join(options)}. What works best?"})
             else:
                 if search_days < 30:
-                    # expand window once
                     await handle_tool_call("check_slots", {"startTime": start_time, "search_days": 30})
                 else:
                     await send_response({"modalities":["audio","text"], "instructions":
                         "I don’t see anything nearby that time. Another day might be better—what day works?"})
 
         elif tool_name == "appointment_webhook":
-            # We only call this AFTER explicit confirm
-            req = ["booking_type","name","email","phone","startTime"]
-
-            # Accumulate from ctx if missing
-            name  = (args.get("name") or ctx.pending_name or "").strip()
+            # Merge args with ctx
+            btype = (args.get("booking_type") or ("reschedule" if ctx.user_intends_reschedule else "book")).strip()
+            name  = (args.get("name")  or ctx.pending_name  or "").strip()
             email = (args.get("email") or ctx.pending_email or "").strip()
             phone = (args.get("phone") or ctx.pending_phone or ctx.caller_number or "").strip()
             start = (args.get("startTime") or ctx.pending_time_iso or "").strip()
-            btype = (args.get("booking_type") or "book").strip()
 
             miss = [k for k,v in {"name":name,"email":email,"phone":phone,"startTime":start}.items() if not v]
             if email and not is_valid_email(email):
                 miss.append("email")
-
             if miss:
                 labels = {"name":"your name (spelled)","email":"an email address (spelled)","phone":"a phone number","startTime":"the day and time"}
                 need = ", ".join(labels.get(m,m) for m in miss)
@@ -677,20 +745,19 @@ async def media(ws: WebSocket):
                     f"To finalize, I just need {need}. You can say them now—please spell name and email."})
                 return
 
-            # Read-back step if we haven’t confirmed yet
-            if not ctx.awaiting_confirmation:
+            # If we arrived here without the explicit “yes”, do a read-back first
+            if not ctx.awaiting_confirmation and ctx.confirm_action not in ("book","reschedule"):
                 ctx.awaiting_confirmation = True
-                ctx.pending_name  = name
-                ctx.pending_email = email
-                ctx.pending_phone = phone
-                ctx.pending_time_iso = start
+                ctx.confirm_action = "reschedule" if btype == "reschedule" else "book"
+                ctx.pending_name, ctx.pending_email, ctx.pending_phone, ctx.pending_time_iso = name, email, phone, start
                 last = last4(phone)
                 await send_response({"modalities":["audio","text"], "instructions":
                     f"Just to confirm, I heard: name {name}; email {email}; phone ending in {last or 'unknown'}; time {start} Eastern. Is that correct?"})
                 return
 
-            # They said yes/correct → proceed to book
+            # Proceed to book/reschedule
             ctx.awaiting_confirmation = False
+            ctx.confirm_action = None
             payload = {
                 "tool": "book",
                 "booking_type": btype,
@@ -720,9 +787,10 @@ async def media(ws: WebSocket):
                     "I couldn’t finalize that just now. Want me to try again or pick a different time?"})
 
         elif tool_name == "cancel_workflow":
-            name = (args.get("name") or "").strip()
-            phone = (args.get("phone") or ctx.caller_number or "").strip()
-            email = (args.get("email") or "").strip()
+            name  = (args.get("name")  or ctx.pending_name  or "").strip()
+            phone = (args.get("phone") or ctx.pending_phone or ctx.caller_number or "").strip()
+            email = (args.get("email") or ctx.pending_email or "").strip()
+
             if not name or not (phone or email):
                 need = []
                 if not name: need.append("name")
@@ -730,10 +798,26 @@ async def media(ws: WebSocket):
                 await send_response({"modalities":["audio","text"], "instructions":
                     "To cancel, I just need " + ", ".join(need) + "."})
                 return
+
+            # If we arrived here without explicit “yes”, read back first
+            if not ctx.awaiting_confirmation and ctx.confirm_action != "cancel":
+                ctx.awaiting_confirmation = True
+                ctx.confirm_action = "cancel"
+                ctx.pending_name, ctx.pending_email, ctx.pending_phone = name, email, phone
+                masked = last4(phone) or "unknown"
+                who = f"name {name}; " + (f"email {email}" if email else f"phone ending in {masked}")
+                await send_response({"modalities":["audio","text"], "instructions":
+                    f"Just to confirm, I’ll cancel the appointment for {who}. Is that correct?"})
+                return
+
+            ctx.awaiting_confirmation = False
+            ctx.confirm_action = None
+
             if not CANCEL_WEBHOOK_URL:
                 await send_response({"modalities":["audio","text"], "instructions":
-                    "I can cancel that once my cancel line is connected. Want me to connect you to the Business Solutions Lead?"})
+                    "I can cancel once my cancel line is connected. Want me to connect you to the Business Solutions Lead?"})
                 return
+
             payload = {"action":"cancel", "name":name, "phone":phone or None, "email": email or None}
             status, data = await json_post(CANCEL_WEBHOOK_URL, payload)
             phone_last = last4(phone)
