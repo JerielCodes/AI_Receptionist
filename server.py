@@ -1,12 +1,11 @@
 # server.py
 """
-ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge (strict English output)
+ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge (stable, greet-first, no-silence)
 
-Key guards in this build:
-- HARD English-only: System + runtime wrapper force English in *every* reply.
-- Will NOT switch languages unless explicitly asked (and even then we keep English).
-- Deterministic confirm → book/reschedule/cancel flow.
-- Barge-in cancellation, greet-once, clean hang-up, transfer support.
+Minimal changes from your last working version:
+- Send greeting only after OpenAI session is up, with a tiny delay so Twilio <Stream> is fully ready.
+- Keep create_response=False so the model never talks unless we tell it to.
+- More robust logging and guards so silent starts are avoided.
 """
 
 import os, json, asyncio, logging, aiohttp, re, uuid
@@ -149,10 +148,10 @@ solutions_short = "We help with SEO websites, AI booking, automations, POS, CRM,
 
 # ---------- INSTRUCTIONS (English hard-lock) ----------
 ENGLISH_LOCK = """
-IMPORTANT LANGUAGE RULES — READ CAREFULLY:
-- You MUST reply in ENGLISH ONLY. Do not reply in any other language under any circumstance.
-- If the caller speaks another language, you still reply in English and continue the conversation in English.
-- If they ask you to switch languages, politely say you are set to English on this line. Do not switch.
+IMPORTANT LANGUAGE RULES:
+- You MUST reply in ENGLISH ONLY. Do not reply in any other language.
+- If the caller speaks another language, still reply in English.
+- If they ask you to switch, politely say this line is set to English. Do not switch.
 """
 
 INSTRUCTIONS = f"""
@@ -161,21 +160,21 @@ System rules for the voice assistant:
 - Say the brand name exactly as “ELvara”.
 - Keep replies brief (1–2 sentences) unless asked for more.
 - If asked “what do you do?”, mention: “{mission_slogan}” and briefly list: {solutions_short}.
-- If asked “how can you help?”, ask what business they run FIRST, then offer 1–2 specific solutions from: SEO websites, AI booking, automations, POS, CRM, social media management.
-- If asked about price: pricing is tailored; free consultation first; then a custom quote. Offer to book a call.
+- If asked “how can you help?”, ask what business they run FIRST, then offer 1–2 specific solutions (SEO websites, AI booking, automations, POS, CRM, social media).
+- If asked about price: tailored pricing; free consultation first; then a custom quote. Offer to book a call.
 - If audio is unclear: say once “Sorry—I didn’t catch that, could you repeat?”; if it happens twice add “Calls are clearest off speaker/headphones.”
 
 Scheduling/cancellation guardrails:
 - Don’t call any tools until you’ve heard at least one complete user utterance AND detected intent.
 - Booking/Reschedule:
-  1) Confirm availability with a check.
-  2) Ask the caller to SPELL full name and email, and collect phone (caller ID acceptable if they agree).
-  3) Read back name, email, phone last-4, and the ET time. Ask “Is that correct?”
-  4) Only after they say yes/correct, proceed to book/reschedule.
+  1) Check availability.
+  2) Collect identity (SPELL full name & email; phone OK via caller ID if they agree).
+  3) Read back name, email, phone last-4, and the ET time → “Is that correct?”
+  4) After yes/correct, call booking/reschedule.
 - Cancellation:
-  1) Collect name, plus email OR phone.
-  2) Read back the identifiers you will use. Ask “Is that correct?”
-  3) Only after they say yes/correct, proceed to cancel.
+  1) Collect name + (email or phone).
+  2) Read back → “Is that correct?”
+  3) After yes/correct, call cancel.
 """
 
 # ---------- TwiML ----------
@@ -260,12 +259,13 @@ async def media(ws: WebSocket):
             data0 = json.loads(first)
             if data0.get("event") == "start":
                 start = data0["start"]
-                caller = to_e164(start.get("from") or "")
+                # Twilio sometimes leaves 'from' blank (caller=None in your logs) → keep None safely
+                caller = to_e164(start.get("from")) if start.get("from") else None
                 ctx = CallContext(
                     call_sid=start.get("callSid",""),
                     stream_sid=start["streamSid"],
                     caller_number=caller,
-                    caller_last4=last4(caller),
+                    caller_last4=last4(caller) if caller else None,
                 )
                 params = (start.get("customParameters") or {})
                 rejoin_reason = params.get("reason")
@@ -303,14 +303,12 @@ async def media(ws: WebSocket):
     assistant_busy: bool = False
 
     async def send_response(payload: Dict[str, Any]):
-        """Raw sender (used only by say_en)."""
         async with send_lock:
             await oai.send_json({"type": "response.create", "response": payload})
 
-    EN_HEADER = "[ENGLISH ONLY — do not use any other language. Reply in English.] "
+    EN_HEADER = "[ENGLISH ONLY — reply in English.] "
 
     async def say_en(text: str):
-        """Always speak English; prepend a hard directive every time."""
         await send_response({
             "modalities": ["audio","text"],
             "instructions": EN_HEADER + (text or "")
@@ -321,6 +319,7 @@ async def media(ws: WebSocket):
         if assistant_busy and active_response_id:
             try:
                 await oai.send_json({"type": "response.cancel", "response": {"id": active_response_id}})
+                log.info(f"OAI: response.cancel id={active_response_id}")
             except Exception as e:
                 log.error(f"OAI cancel failed: {e}")
 
@@ -380,14 +379,13 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 1200,
-                    "create_response": False,
+                    "create_response": False,   # <— model never speaks unless we call say_en(...)
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": "alloy",
                 "modalities": ["audio","text"],
-                # Keep transcription in EN to reduce drift
                 "input_audio_transcription": {"model": "gpt-4o-mini-transcribe", "language": "en"},
                 "instructions": (
                     INSTRUCTIONS +
@@ -397,7 +395,13 @@ async def media(ws: WebSocket):
                 "tools": tools
             }
         })
+
+        # Tiny delay so Twilio stream is fully ready, then greet ONCE
+        await asyncio.sleep(0.2)
         await say_en(greetings[0])
+        log.info("Sent greeting to caller.")
+        ctx.greeted = True
+
     except Exception as e:
         log.error(f"OpenAI session.setup failed: {e}")
         if tw_client and ctx and ctx.call_sid and valid_e164(TRANSFER_NUMBER):
@@ -434,6 +438,7 @@ async def media(ws: WebSocket):
                 ev = data.get("event")
                 if ev == "media":
                     payload = (data.get("media", {}).get("payload") or "")
+                    # Forward caller audio to OAI buffer
                     await oai.send_json({"type":"input_audio_buffer.append","audio": payload})
                 elif ev == "stop":
                     reason = (data.get("stop") or {}).get("reason")
@@ -454,12 +459,14 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
-                    # Lifecycle
                     if t == "response.created":
                         assistant_busy = True
                         active_response_id = (evt.get("response") or {}).get("id")
+                        log.info(f"OAI: response.created id={active_response_id}")
                     elif t == "response.done":
                         assistant_busy = False
+                        rid = (evt.get("response") or {}).get("id")
+                        log.info(f"OAI: response.done id={rid}")
                         active_response_id = None
                         if ctx.closing and not closing_sent:
                             closing_sent = True
@@ -469,22 +476,26 @@ async def media(ws: WebSocket):
                             await asyncio.sleep(0.2)
                             break
 
-                    # Stream audio
                     elif t == "response.audio.delta" and ctx and ctx.stream_sid:
+                        # Send synthesized audio back to Twilio
                         try:
-                            await ws.send_text(json.dumps({"event":"media","streamSid": ctx.stream_sid,"media":{"payload": evt["delta"]}}))
+                            await ws.send_text(json.dumps({
+                                "event":"media",
+                                "streamSid": ctx.stream_sid,
+                                "media": {"payload": evt["delta"]}
+                            }))
                         except Exception:
                             break
 
-                    # Barge-in
                     elif t == "input_audio_buffer.speech_started" and ctx and ctx.stream_sid:
+                        # Barge-in: clear audio & cancel only if something is speaking
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event":"clear","streamSid": ctx.stream_sid}))
                         await cancel_active_response()
 
-                    # Transcript assembly
                     elif t == "conversation.item.input_audio_transcription.delta":
                         user_buf.append(evt.get("delta") or "")
+
                     elif t == "conversation.item.input_audio_transcription.completed":
                         text = "".join(user_buf).strip(); user_buf.clear()
                         if not text:
@@ -494,12 +505,12 @@ async def media(ws: WebSocket):
                         ctx.last_user_input = text
                         low = text.lower()
 
-                        # If they ask to switch languages explicitly → politely refuse and keep English
+                        # Politely refuse language switch; keep English
                         if re.search(r"\b(can|could)\s+you\s+(speak|talk)\b", low) and re.search(r"\b(in|)\s*[a-zA-ZÀ-ÿ]+\b", low):
                             await say_en("I’m set to speak English on this line. How can I help you today?")
                             continue
 
-                        # Clarity rules (skip while waiting for yes/no)
+                        # Clarity (skip during yes/no confirmation)
                         if len(text.split()) <= 2 and not ctx.awaiting_confirmation:
                             ctx.misunderstand_count += 1
                             tip = " Calls are clearest off speaker or headphones." if ctx.misunderstand_count >= 2 else ""
@@ -513,7 +524,7 @@ async def media(ws: WebSocket):
                         if detect_cancel_intent(text):     ctx.user_intends_cancel = True
                         if detect_schedule_intent(text):   ctx.user_intends_scheduling = True
 
-                        # Deterministic YES/NO confirmation
+                        # Deterministic YES/NO
                         if ctx.awaiting_confirmation and ctx.confirm_action:
                             if re.search(r"\b(yes|correct|that'?s\s+right|sounds\s+good|confirm)\b", low):
                                 action = ctx.confirm_action
@@ -603,7 +614,6 @@ async def media(ws: WebSocket):
                         # Default discovery
                         await say_en("Got it. Tell me a bit about your business and your goals—then we’ll pick the best next step.")
 
-                    # Tool call wiring
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") == "function_call":
@@ -636,7 +646,7 @@ async def media(ws: WebSocket):
 
     # ---------- Tool handlers ----------
     async def handle_tool_call(tool_name: str, args: Dict[str, Any]):
-        if not ctx.heard_any_user_utterance:
+        if not ctx.heard_any_user_utterance and tool_name != "transfer_call":
             await say_en("Happy to help. What day and time works best?")
             return
 
