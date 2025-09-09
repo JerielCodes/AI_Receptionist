@@ -1,11 +1,14 @@
 # server.py
 """
-ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge (stable, greet-first, no-silence)
+ELvara AI Receptionist — Twilio <-> OpenAI Realtime bridge
+(greet-first, English-only, no-silence, minimal changes)
 
-Minimal changes from your last working version:
-- Send greeting only after OpenAI session is up, with a tiny delay so Twilio <Stream> is fully ready.
-- Keep create_response=False so the model never talks unless we tell it to.
-- More robust logging and guards so silent starts are avoided.
+What’s new here (vs your last file):
+- Greets once after session.update with a small delay (500ms) so Twilio’s <Stream> is fully ready.
+- Strict English lock (never switch; politely decline language switch requests).
+- Robust audio piping with a tiny frame counter logger so you can see outgoing audio deltas.
+- Keeps create_response=False so the model never talks unless we explicitly tell it to.
+- Preserves your booking / reschedule / cancel flows and tool gating.
 """
 
 import os, json, asyncio, logging, aiohttp, re, uuid
@@ -59,24 +62,20 @@ class CallContext:
     state: ConversationState = ConversationState.GREETING
     last_user_input: str = ""
     misunderstand_count: int = 0
-    lang: str = "en"  # speak English unless explicitly asked to switch
-
+    lang: str = "en"  # speak English unless explicitly asked to switch (we still decline)
     # Intents
     heard_any_user_utterance: bool = False
     user_intends_scheduling: bool = False
     user_intends_cancel: bool = False
     user_intends_reschedule: bool = False
-
     # Collected identity/time
     pending_name: Optional[str] = None
     pending_email: Optional[str] = None
     pending_phone: Optional[str] = None
     pending_time_iso: Optional[str] = None
-
     # Confirmation
     awaiting_confirmation: bool = False
     confirm_action: Optional[str] = None  # "book"|"reschedule"|"cancel"
-
     closing: bool = False
 
 # ---------- UTILS ----------
@@ -109,6 +108,7 @@ def is_valid_email(v: str | None) -> bool:
 
 def default_today_anchor_iso() -> str:
     now = datetime.now(ZoneInfo(DEFAULT_TZ))
+    # If before 3pm ET, anchor 3pm; else next whole hour up to 7pm
     anchor = datetime.combine(now.date(), time(15, 0), tzinfo=ZoneInfo(DEFAULT_TZ))
     if now > anchor:
         hour = min(now.hour + 1, 19)
@@ -142,8 +142,8 @@ brand = KB.get("brand", "ELvara")
 greetings = KB.get("greeting_templates", {}).get("primary", [
     "Thank you for calling ELvara. How can I help you today?",
 ])
-mission_slogan = "Our mission is growth—handling the systems and strategies that move your business forward."
-pricing_line   = "Everything is tailored to your business. We start with a free consultation, then provide a quote that fits exactly what you need."
+mission_slogan  = "Our mission is growth—handling the systems and strategies that move your business forward."
+pricing_line    = "Everything is tailored to your business. We start with a free consultation, then provide a quote that fits exactly what you need."
 solutions_short = "We help with SEO websites, AI booking, automations, POS, CRM, and social media management."
 
 # ---------- INSTRUCTIONS (English hard-lock) ----------
@@ -259,7 +259,7 @@ async def media(ws: WebSocket):
             data0 = json.loads(first)
             if data0.get("event") == "start":
                 start = data0["start"]
-                # Twilio sometimes leaves 'from' blank (caller=None in your logs) → keep None safely
+                # Twilio may omit 'from' → keep None safely
                 caller = to_e164(start.get("from")) if start.get("from") else None
                 ctx = CallContext(
                     call_sid=start.get("callSid",""),
@@ -301,8 +301,10 @@ async def media(ws: WebSocket):
     send_lock = asyncio.Lock()
     active_response_id: Optional[str] = None
     assistant_busy: bool = False
+    audio_frame_counter = 0  # NEW: for debugging outgoing audio
 
     async def send_response(payload: Dict[str, Any]):
+        nonlocal assistant_busy, active_response_id
         async with send_lock:
             await oai.send_json({"type": "response.create", "response": payload})
 
@@ -379,7 +381,7 @@ async def media(ws: WebSocket):
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": 1200,
-                    "create_response": False,   # <— model never speaks unless we call say_en(...)
+                    "create_response": False,   # never speak unless we call say_en(...)
                     "interrupt_response": True
                 },
                 "input_audio_format": "g711_ulaw",
@@ -396,8 +398,8 @@ async def media(ws: WebSocket):
             }
         })
 
-        # Tiny delay so Twilio stream is fully ready, then greet ONCE
-        await asyncio.sleep(0.2)
+        # Small delay so Twilio <Stream> is fully ready, then greet ONCE
+        await asyncio.sleep(0.5)
         await say_en(greetings[0])
         log.info("Sent greeting to caller.")
         ctx.greeted = True
@@ -451,7 +453,7 @@ async def media(ws: WebSocket):
 
     # ---------- OpenAI→Twilio ----------
     async def openai_to_twilio():
-        nonlocal assistant_busy, active_response_id, closing_sent
+        nonlocal assistant_busy, active_response_id, closing_sent, audio_frame_counter
         try:
             while True:
                 msg = await oai.receive()
@@ -459,6 +461,7 @@ async def media(ws: WebSocket):
                     evt = json.loads(msg.data)
                     t = evt.get("type")
 
+                    # Lifecycle
                     if t == "response.created":
                         assistant_busy = True
                         active_response_id = (evt.get("response") or {}).get("id")
@@ -476,9 +479,13 @@ async def media(ws: WebSocket):
                             await asyncio.sleep(0.2)
                             break
 
+                    # Synth audio → Twilio
                     elif t == "response.audio.delta" and ctx and ctx.stream_sid:
-                        # Send synthesized audio back to Twilio
                         try:
+                            audio_frame_counter += 1
+                            # Log every ~50 frames so logs are light but prove audio is flowing
+                            if audio_frame_counter % 50 == 0:
+                                log.info(f"Forwarded audio frames: {audio_frame_counter}")
                             await ws.send_text(json.dumps({
                                 "event":"media",
                                 "streamSid": ctx.stream_sid,
@@ -487,12 +494,13 @@ async def media(ws: WebSocket):
                         except Exception:
                             break
 
+                    # Barge-in
                     elif t == "input_audio_buffer.speech_started" and ctx and ctx.stream_sid:
-                        # Barge-in: clear audio & cancel only if something is speaking
                         with suppress(Exception):
                             await ws.send_text(json.dumps({"event":"clear","streamSid": ctx.stream_sid}))
                         await cancel_active_response()
 
+                    # Collect transcript
                     elif t == "conversation.item.input_audio_transcription.delta":
                         user_buf.append(evt.get("delta") or "")
 
@@ -595,7 +603,7 @@ async def media(ws: WebSocket):
                             ctx.confirm_action = "cancel"
                             continue
 
-                        # Reschedule flow prompts
+                        # Reschedule prompts
                         if ctx.user_intends_reschedule:
                             if not ctx.pending_time_iso:
                                 await say_en("What day and time would you like instead?")
@@ -614,6 +622,7 @@ async def media(ws: WebSocket):
                         # Default discovery
                         await say_en("Got it. Tell me a bit about your business and your goals—then we’ll pick the best next step.")
 
+                    # Tool call wiring
                     elif t == "response.output_item.added":
                         item = evt.get("item", {})
                         if item.get("type") == "function_call":
